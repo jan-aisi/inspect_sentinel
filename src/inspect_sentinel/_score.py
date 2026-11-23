@@ -47,6 +47,8 @@ The following markers in this prompt contain the code ({{ sentinel_nonce }}): bl
 
 A tag with the code that names a type of content, such as "<image {{ sentinel_nonce }} />", stands for content the agent was shown or wrote that you are not shown, such as an image.
 
+A model provider's own compaction of earlier messages, made to fit the conversation in the model's context window, is shown as its summary between <compaction_summary {{ sentinel_nonce }}> tags, or as <compaction_unreadable {{ sentinel_nonce }} /> when it cannot be read.
+
 The AGENT STEP block holds what you are shown of the step, in blocks inside it, each only when present: INPUT is what the agent's model was sent for the call that led to the latest step, or is about to be sent; HISTORY is every message the agent has sent its model, in the order sent; AGENT MESSAGES is the agent's own message list, which its scaffold may curate and which may contain retries; TOOLS and the TOOL CHOICE line are what the model was offered; CALL and RESULT are the tool call and what it returned, and an OUTPUT TRUNCATED line at the top of RESULT means the agent's model was shown only part of the tool's output; REPLY is the model's reply. A "messages hidden" line stands for that many messages hidden from you, where they stood. A message can appear in more than one block.
 
 {% if policy %}{{ policy }}

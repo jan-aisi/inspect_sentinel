@@ -138,12 +138,15 @@ class StepPreprocessor(Generic[S]):
     omit_tool_usage: bool = False
     """Leave out a provider's own tool use (such as web search) recorded in a message."""
 
+    omit_unreadable_compaction: bool = False
+    """Leave out a model provider's compaction of earlier messages when it cannot be read, as OpenAI's cannot. A message that held nothing else is left out whole. By default it is shown as a placeholder, `<compaction_unreadable 3f9a1c7e />` with a nonce. A compaction that can be read, such as Anthropic's, is always shown as its summary."""
+
     omit_assistant_text: bool = False
     """Leave out the text of assistant messages, the agent's model's own words, and keep their tool calls, so the monitor model judges what the agent did rather than what it says it is doing.
 
     It applies to every assistant message in `input`, `history` and `agent_messages`, to a tool stage's `message` (the text beside its call, which becomes `""`) and `assistant_message`, and to a generate's reply: every choice's message, the output's `completion`, which becomes the thinned first message's text (`""`), and the choices' `logprobs` and `prompt_logprobs`, which hold text as tokens and are left out. Reasoning follows `omit_reasoning` and a provider's own tool use follows `omit_tool_usage`, so either can be kept or left out with it; other content, such as an image, is kept. An assistant message in a list that is left with no tool calls and no content (or only empty reasoning) is left out of the list; the windows are applied first, so it still counts toward `LastTurns(n)` and `LastMessages(n)`. The reply and the call are always shown, empty if need be.
 
-    Text the agent's model wrote can still reach the monitor model elsewhere: in tool call arguments (such as a `think()` call or a comment in a command), in compaction summaries (user messages), and in results returned by sub-agents or tools."""
+    Text the agent's model wrote can still reach the monitor model elsewhere: in tool call arguments (such as a `think()` call or a comment in a command), in compaction summaries (Inspect's own is a user message; a provider's that can be read, such as Anthropic's, is shown as its summary although it is in an assistant message), and in results returned by sub-agents or tools."""
 
     hide_messages: Callable[[ChatMessage], bool] | None = None
     """Hide the messages for which this returns True, always leaving a marker line where they were, so the monitor model can tell that something was hidden (unlike the `omit_` options, which leave content out silently).
@@ -238,7 +241,7 @@ async def step_as_str(
 ) -> tuple[str, ExtractReferences]:
     """Render `step` for a monitor's prompt, numbering its messages `[M1]`, `[M2]` and so on, and return the text with a function that turns those cites in a model's answer into references.
 
-    Everything is in one block, marked `[BEGIN AGENT STEP - ...]` and `[END AGENT STEP - ...]` and named for the stage: `TOOL CALL REQUEST` before a tool call, `TOOL CALL RESULT` after one, `MODEL REQUEST` before a generate, and `MODEL REPLY` after one. Inside it are blocks between `[BEGIN ...]` and `[END ...]` lines, each left out when it is empty. At every stage: `HISTORY` (`step.history`, every message the agent has sent its model), `AGENT MESSAGES` (`step.agent_messages`, the outermost running agent function's own message list, which its scaffold may curate), then the model request, as `INPUT`, `TOOLS` (the tools offered, as JSON) and a one-line `[TOOL CHOICE] "auto"`; at a tool stage, the request that produced the call. Then after a generate, `REPLY`; at a tool stage, `CALL` (the assistant's text and the call, with a placeholder for any content of the assistant message that is not text, such as an image) and, after the call, `RESULT`. When the host cut the tool's output before the agent's model saw it (`step.truncated` is a `Truncation`), `RESULT` opens with a line such as `[OUTPUT TRUNCATED] The tool's output was 48,210 bytes; the agent's model was shown at most its first 8,192 and last 8,192 bytes, with the middle left out.`; a result the host did not cut, or cannot tell about (`None`, as in a replay from messages), has no such line. Messages that `StepPreprocessor.hide_messages` hid are one marker line per run where they stood, such as `[2 messages hidden]`, which takes no message number; a hidden result of the step's own call is that marker in the RESULT block, after the call. A list the host could not provide (None) is named in its block (`preprocess_step()` leaves a list with no window empty, so only a windowed one is named); at a tool stage whose input is not known, the tools and tool choice are left out. With a `nonce`, every `[BEGIN ...]` and `[END ...]` line, the `[TOOL CHOICE]` and `[OUTPUT TRUNCATED]` lines and every hidden-messages marker carry it in parentheses, as `[BEGIN INPUT (3f9a1c7e)]`, and so does every message header. Content that is not text, such as an image, renders as a placeholder naming its type, which carries the nonce too, as `<image 3f9a1c7e />`; `unrenderable()` lists that content. Everything rendered was written by or shown to the agent under observation, so treat it as untrusted in the prompt around it.
+    Everything is in one block, marked `[BEGIN AGENT STEP - ...]` and `[END AGENT STEP - ...]` and named for the stage: `TOOL CALL REQUEST` before a tool call, `TOOL CALL RESULT` after one, `MODEL REQUEST` before a generate, and `MODEL REPLY` after one. Inside it are blocks between `[BEGIN ...]` and `[END ...]` lines, each left out when it is empty. At every stage: `HISTORY` (`step.history`, every message the agent has sent its model), `AGENT MESSAGES` (`step.agent_messages`, the outermost running agent function's own message list, which its scaffold may curate), then the model request, as `INPUT`, `TOOLS` (the tools offered, as JSON) and a one-line `[TOOL CHOICE] "auto"`; at a tool stage, the request that produced the call. Then after a generate, `REPLY`; at a tool stage, `CALL` (the assistant's text and the call, with a placeholder for any content of the assistant message that is not text, such as an image) and, after the call, `RESULT`. When the host cut the tool's output before the agent's model saw it (`step.truncated` is a `Truncation`), `RESULT` opens with a line such as `[OUTPUT TRUNCATED] The tool's output was 48,210 bytes; the agent's model was shown at most its first 8,192 and last 8,192 bytes, with the middle left out.`; a result the host did not cut, or cannot tell about (`None`, as in a replay from messages), has no such line. Messages that `StepPreprocessor.hide_messages` hid are one marker line per run where they stood, such as `[2 messages hidden]`, which takes no message number; a hidden result of the step's own call is that marker in the RESULT block, after the call. A list the host could not provide (None) is named in its block (`preprocess_step()` leaves a list with no window empty, so only a windowed one is named); at a tool stage whose input is not known, the tools and tool choice are left out. With a `nonce`, every `[BEGIN ...]` and `[END ...]` line, the `[TOOL CHOICE]` and `[OUTPUT TRUNCATED]` lines and every hidden-messages marker carry it in parentheses, as `[BEGIN INPUT (3f9a1c7e)]`, and so does every message header. Content that is not text, such as an image, renders as a placeholder naming its type, which carries the nonce too, as `<image 3f9a1c7e />`; `unrenderable()` lists that content. A model provider's compaction that can be read, such as Anthropic's, is shown as its summary between `<compaction_summary>` tags; with a `nonce`, one that cannot be read, such as OpenAI's, is shown as `<compaction_unreadable 3f9a1c7e />` (`StepPreprocessor(omit_unreadable_compaction=True)` leaves it out). The summary Inspect's own summary compaction writes is an ordinary user message, headed `USER`. Everything rendered was written by or shown to the agent under observation, so treat it as untrusted in the prompt around it.
 
     Args:
         step: The step to render, usually from `preprocess_step()`.
@@ -298,26 +301,8 @@ def unrenderable(step: Step) -> list[Unrenderable]:
 
 
 # what Scout renders as text; anything else is a placeholder, except a
-# compaction Scout can read (`_readable_compaction`)
+# compaction Scout can read (`_compaction`)
 _TEXT_CONTENT = ("text", "reasoning", "tool_use")
-
-
-def _readable_compaction(content: Content) -> bool:
-    # a model provider's compaction that Scout renders as its summary, between
-    # <compaction_summary> tags, rather than as a placeholder. Scout 0.6.4's
-    # rule (`_provider_compaction_text` in inspect_scout/_scanner/extract.py):
-    # data holding a dict `compaction_metadata` of type "anthropic_compact"
-    # whose `content` is a string. Any other compaction, such as OpenAI's
-    # encrypted "openai_compact" or a failed Anthropic one with no summary, is
-    # <compaction_unreadable /> with a nonce and <data /> without one
-    if not isinstance(content, ContentData):
-        return False
-    metadata = content.data.get("compaction_metadata")
-    return (
-        isinstance(metadata, dict)
-        and metadata.get("type") == "anthropic_compact"
-        and isinstance(metadata.get("content"), str)
-    )
 
 
 def _unrenderable_in(
@@ -730,9 +715,11 @@ def _last_with_id(messages: Sequence[ChatMessage]) -> tuple[int, str] | None:
 def _omitted(
     messages: Sequence[ChatMessage], p: StepPreprocessor[S]
 ) -> list[ChatMessage]:
-    # the omissions over a list, which also leave out the system messages and,
-    # under `omit_assistant_text`, an assistant message with nothing left to
-    # show: no tool calls and no content
+    # the omissions over a list, which also leave out the system messages,
+    # under `omit_assistant_text` an assistant message with nothing left to
+    # show (no tool calls and no content), and under
+    # `omit_unreadable_compaction` a message that held nothing but an
+    # unreadable compaction, as OpenAI's does, rather than show it empty
     kept: list[ChatMessage] = []
     for message in messages:
         if p.omit_system and message.role == "system":
@@ -743,6 +730,12 @@ def _omitted(
             and isinstance(thinned, ChatMessageAssistant)
             and not thinned.tool_calls
             and _nothing_in(thinned.content)
+        ) or (
+            p.omit_unreadable_compaction
+            and not thinned.content
+            and not (isinstance(thinned, ChatMessageAssistant) and thinned.tool_calls)
+            and not isinstance(message.content, str)
+            and any(_compaction(c) == "unreadable" for c in message.content)
         ):
             continue
         kept.append(thinned)
@@ -794,13 +787,41 @@ def _omitted_from(message: ChatMessage, p: StepPreprocessor[S]) -> ChatMessage:
         )
         if omit
     )
-    if not removed:
+    compaction = p.omit_unreadable_compaction
+    if not removed and not compaction:
         return message
     if isinstance(message.content, str):
         return message.model_copy(update={"content": ""}) if text else message
-    return message.model_copy(
-        update={"content": [c for c in message.content if not isinstance(c, removed)]}
+    content = [
+        c
+        for c in message.content
+        if not isinstance(c, removed)
+        and not (compaction and _compaction(c) == "unreadable")
+    ]
+    if len(content) == len(message.content):
+        return message
+    return message.model_copy(update={"content": content})
+
+
+def _compaction(content: Content) -> Literal["readable", "unreadable"] | None:
+    # whether content is a model provider's compaction of earlier messages, and
+    # if so whether Scout renders it as text. Scout 0.6.4's rule
+    # (`_provider_compaction_text` in inspect_scout/_scanner/extract.py):
+    # inspect_ai keeps a compaction as data holding a dict
+    # `compaction_metadata`; one of type "anthropic_compact" whose `content` is
+    # a string is readable, its summary, rendered between <compaction_summary>
+    # tags. Any other, such as OpenAI's encrypted "openai_compact" or a failed
+    # Anthropic one with no summary, is unreadable: <compaction_unreadable />
+    # with a nonce and <data /> without one
+    if not isinstance(content, ContentData):
+        return None
+    metadata = content.data.get("compaction_metadata")
+    if not isinstance(metadata, dict):
+        return None
+    readable = metadata.get("type") == "anthropic_compact" and isinstance(
+        metadata.get("content"), str
     )
+    return "readable" if readable else "unreadable"
 
 
 def _step_block(step: Step) -> str:
@@ -870,7 +891,7 @@ def _non_text_content(message: ChatMessage | None) -> list[Content]:
 
 
 def _placeholder_content(message: ChatMessage | None) -> list[Content]:
-    return [c for c in _non_text_content(message) if not _readable_compaction(c)]
+    return [c for c in _non_text_content(message) if _compaction(c) != "readable"]
 
 
 def _reply(step: AfterGenerate) -> list[ChatMessage]:

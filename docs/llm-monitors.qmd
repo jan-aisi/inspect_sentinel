@@ -1,7 +1,7 @@
 ---
 title: "LLM Monitors"
 description: "Monitors that ask a model to score each step, through context.host.score() or context.host.generate()."
-llms-description: "Writing LLM monitors: context.host.score() with dimensions and a policy, model and role parameters and the monitor model role, StepPreprocessor windows (AllMessages, LastTurns, LastMessages, NewSinceLastReport), actions-only monitors with omit_assistant_text, custom prompts with generate(), preprocess_step() and step_as_str(), nonces for untrusted agent text, images and other content the model can't see (on_unrenderable, unrenderable()), marking tool calls a person reviewed, hiding side-task instructions with hide_messages (a marker in their place; match on metadata in-process, on text for bridged agents) with agent_messages, prompt templates, and context-window fitting."
+llms-description: "Writing LLM monitors: context.host.score() with dimensions and a policy, model and role parameters and the monitor model role, StepPreprocessor windows (AllMessages, LastTurns, LastMessages, NewSinceLastReport), actions-only monitors with omit_assistant_text, how compaction summaries are shown, custom prompts with generate(), preprocess_step() and step_as_str(), nonces for untrusted agent text, images and other content the model can't see (on_unrenderable, unrenderable()), marking tool calls a person reviewed, hiding side-task instructions with hide_messages (a marker in their place; match on metadata in-process, on text for bridged agents) with agent_messages, prompt templates, and context-window fitting."
 ---
 
 ## Overview
@@ -183,6 +183,7 @@ The preprocessor has these other options:
 | `omit_system` | `True` | Leave out system messages. |
 | `omit_reasoning` | `False` | Leave out the agent's model's reasoning. |
 | `omit_tool_usage` | `False` | Leave out a provider's own tool use, such as web search. |
+| `omit_unreadable_compaction` | `False` | Leave out a model provider's compaction that can't be read (see [After a Compaction](#after-a-compaction)). |
 | `omit_assistant_text` | `False` | Leave out the text of the agent's model's messages and keep their tool calls (see [Judging Actions Only](#judging-actions-only)). |
 | `hide_messages` | `None` | A function that returns `True` for each system, user or tool message to hide behind a marker (see [Hiding Side-Task Instructions](#hiding-side-task-instructions)). |
 | `transform` | `None` | An async function that takes the step and returns a step of the same type. |
@@ -248,6 +249,24 @@ StepPreprocessor(input_window=NewSinceLastReport(context))
 ```
 
 If the message the monitor last saw is gone, as after [compaction](https://inspect.aisi.org.uk/compaction.html) (Inspect's shortening of a long conversation to fit the context window), the whole list is shown.
+
+### After a Compaction
+
+A [compaction](https://inspect.aisi.org.uk/compaction.html) shortens a long conversation to fit the agent's model's context window. After one, `input` holds the compacted request: usually a summary of the earlier messages, then the latest turns. `history` still holds the messages the compaction dropped, so set its window to show them.
+
+How the summary is shown depends on what made it:
+
+| Compaction | Shown as |
+|------------------------------------|------------------------------------|
+| Inspect's summary (`CompactionSummary`, or the fallback of `CompactionAuto`) | An ordinary user message, headed `USER`, whose text contains Inspect's `[CONTEXT COMPACTION SUMMARY]` label. |
+| Anthropic's native compaction | The summary, between `<compaction_summary 3f9a1c7e>` tags. |
+| OpenAI's native compaction | `<compaction_unreadable 3f9a1c7e />`, since OpenAI encrypts it. |
+
+The `[CONTEXT COMPACTION SUMMARY]` label is text, so agent text can imitate it, and a message holding it may also hold a user's own words: for providers that need consecutive user messages merged (e.g. Anthropic), Inspect merges the summary with the task or another user turn next to it.
+
+The two tags carry the nonce (see [Untrusted Text](#untrusted-text)), so text that imitates one is shown as text. `score()` tells the monitor model what they mean. Without a nonce, as from `step_as_str()` called without one, OpenAI's compaction is shown as `<data />`.
+
+To leave an unreadable compaction out, use `StepPreprocessor(omit_unreadable_compaction=True)`. A message that held nothing else is left out too.
 
 ## Untrusted Text
 
@@ -486,7 +505,7 @@ How you mark a message depends on how the agent runs:
 
 In a replay from a log, a tool result that Inspect can't find among the logged messages has no metadata, so a predicate that matches only on metadata shows that result. Such a result keeps its text and the tool's name. If the hidden text comes from a tool of its own, also match on the tool's name (e.g. `m.role == "tool" and m.function == "side_task_briefing"`); otherwise, a metadata predicate can't keep that result hidden in replay.
 
-[Compaction](https://inspect.aisi.org.uk/compaction.html) can restate a hidden message in its summary, and Inspect doesn't record which messages a summary replaced. If a hidden message may be compacted, hide the summaries too: Inspect marks its summary messages with `metadata={"summary": True}`.
+[Compaction](https://inspect.aisi.org.uk/compaction.html) can restate a hidden message in its summary, and Inspect doesn't record which messages a summary replaced. If a hidden message may be compacted, hide the summaries too: Inspect marks its summary messages with `metadata={"summary": True}`. A provider's own compaction is different: Anthropic's is in an assistant message, which `hide_messages` never hides, so it is shown as its summary (see [After a Compaction](#after-a-compaction)); to keep it from the monitor model, leave it out with a `transform`.
 
 ### Showing Only the Agent's Own Messages
 
