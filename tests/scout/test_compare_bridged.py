@@ -1,3 +1,4 @@
+import json
 from itertools import count
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -6,7 +7,8 @@ import pytest
 from inspect_ai import Task, eval
 from inspect_ai.agent import Agent, AgentState, agent, agent_bridge, as_solver
 from inspect_ai.dataset import Sample
-from inspect_ai.event import ModelEvent
+from inspect_ai.event import ModelEvent, SentinelEvent
+from inspect_ai.log import list_eval_logs, read_eval_log
 from inspect_ai.model import (
     ChatCompletionChoice,
     ChatMessageAssistant,
@@ -17,6 +19,7 @@ from inspect_ai.model import (
     get_model,
 )
 from inspect_ai.tool import ToolCall, ToolChoice, ToolInfo
+from inspect_ai.util import span
 from inspect_scout import scan, scan_results_df, transcripts_from
 
 from inspect_sentinel import (
@@ -37,6 +40,7 @@ from inspect_sentinel.scout import (
     replay_check,
     replay_check_differences,
 )
+from inspect_sentinel.scout._probe import _hash
 
 Row = dict[str, Any]
 Client = Literal["openai", "anthropic"]
@@ -687,3 +691,162 @@ def test_replay_check_matches_a_bridge_check_with_the_step_it_checked(
 
     # replay hands a monitor the call and result a live bridge check saw
     assert differences.empty
+
+
+def assistant_messages(frame: Any) -> list[tuple[str, str, str]]:
+    # each tool step's stage, step id and assistant_message digest, from
+    # replay_check() rows
+    found: list[tuple[str, str, str]] = []
+    for row in records(frame):
+        stage = str(row["metadata.stage"])
+        if not stage.startswith("tool"):
+            continue
+        metadata = row["metadata.metadata"]
+        metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+        found.append(
+            (stage, str(row["metadata.step_id"]), metadata["step"]["assistant_message"])
+        )
+    return found
+
+
+def test_replay_gives_a_renamed_call_the_assistant_message_the_bridge_handed_over(
+    tmp_path: Path,
+) -> None:
+    # the second turn reuses "a" for another call, so the bridge hands it over
+    # under a fresh id, which it records on the model call
+    first, second, _ = run(
+        tmp_path,
+        [calls("a"), calls("a", path="other")],
+        "openai",
+        observe_only(replay_check()),
+    )
+    [log] = list_eval_logs(str(tmp_path / "logs"))
+    sample = read_eval_log(log).samples
+    assert sample is not None
+    [renamed] = [
+        e
+        for e in sample[0].events
+        if isinstance(e, ModelEvent) and str(e.uuid) == second
+    ]
+    assert renamed.agent_tool_call_ids is not None
+    [fresh] = renamed.agent_tool_call_ids
+    assert fresh != "a"
+    frames = scanned(
+        tmp_path,
+        replayed=as_scanner(replay_check()),
+        recorded=as_reader("replay_check"),
+    )
+    replayed = assistant_messages(frames["replayed"])
+    recorded = assistant_messages(frames["recorded"])
+
+    # replay names the renamed call's steps by its fresh id, and builds no
+    # result step for "a", which the conversation proposed twice
+    assert sorted((stage, step) for stage, step, _ in replayed) == sorted(
+        [
+            ("tool_call", f"{first}/a"),
+            ("tool_call", f"{second}/{fresh}"),
+            ("tool_result", f"{second}/{fresh}"),
+        ]
+    )
+    # the message the bridge handed over: the second model call's output with
+    # the fresh id in place of the model's (the digest leaves out message ids)
+    handed = renamed.output.message.model_copy(deep=True)
+    assert handed.tool_calls is not None
+    handed.tool_calls[0].id = fresh
+    expected = _hash(handed)
+    assert expected != _hash(renamed.output.message)
+    # the live checks of the renamed call, by the execution their sentinel
+    # events record for its fresh id
+    [execution] = {
+        e.execution_id
+        for e in sample[0].events
+        if isinstance(e, SentinelEvent) and e.step_id == fresh
+    }
+    replayed_by_step = {(stage, step): digest for stage, step, digest in replayed}
+    recorded_by_step = {(stage, step): digest for stage, step, digest in recorded}
+    for stage in ("tool_call", "tool_result"):
+        assert replayed_by_step[(stage, f"{second}/{fresh}")] == expected
+        assert recorded_by_step[(stage, str(execution))] == expected
+
+
+@agent(name="two_conversations")
+def two_conversations() -> Agent:
+    async def execute(state: AgentState) -> AgentState:
+        async with agent_bridge(state) as bridge:
+            # one bridge, two conversations, each in an agent span of its own
+            for task in ("first task", "second task"):
+                async with span(task, type="agent"):
+                    await _openai_loop(task, False)
+            return bridge.state
+
+    return execute
+
+
+MODEL_CALL_FIELDS = ("assistant_message", "input", "tools", "tool_choice")
+
+
+def model_call_fields(frame: Any) -> list[tuple[str, dict[str, str]]]:
+    # each tool_result row's step id and digests of the four fields from the
+    # model call, from replay_check() rows
+    found: list[tuple[str, dict[str, str]]] = []
+    for row in records(frame):
+        if row["metadata.stage"] != "tool_result":
+            continue
+        metadata = row["metadata.metadata"]
+        metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+        step = metadata["step"]
+        found.append(
+            (str(row["metadata.step_id"]), {f: step[f] for f in MODEL_CALL_FIELDS})
+        )
+    return found
+
+
+def test_replay_fills_in_what_live_left_none_for_a_call_handed_over_in_two_conversations(
+    tmp_path: Path,
+) -> None:
+    # each conversation's model proposes "a" once: the bridge tracks handouts
+    # across its conversations, so live it can't tie the second result to one;
+    # replay counts proposals per conversation
+    done = ModelOutput.from_content("mockllm/model", "done")
+    [log] = eval(
+        Task(
+            dataset=[Sample(input="go")],
+            solver=as_solver(two_conversations()),
+            sentinel=observe_only(replay_check()),
+        ),
+        model=get_model(
+            "mockllm/model", custom_outputs=[calls("a"), done, calls("a"), done]
+        ),
+        log_dir=str(tmp_path / "logs"),
+        display="none",
+    )
+    assert log.status == "success", log.error
+    assert log.samples is not None
+    first, _, second, _ = [
+        str(e.uuid)
+        for e in log.samples[0].events
+        if isinstance(e, ModelEvent) and e.requested_model is not None
+    ]
+    frames = scanned(
+        tmp_path,
+        replayed=as_scanner(replay_check()),
+        recorded=as_reader("replay_check"),
+    )
+    none = _hash(None)
+
+    # live, the first conversation's result has the four fields and the
+    # second's has them None
+    live = [digests for _, digests in model_call_fields(frames["recorded"])]
+    assert sorted(set(d.values()) == {none} for d in live) == [False, True]
+    assert sum(none in d.values() for d in live) == 1
+    # replay builds both results with the four fields set
+    replayed = dict(model_call_fields(frames["replayed"]))
+    assert replayed.keys() == {f"{first}/a", f"{second}/a"}
+    assert all(none not in d.values() for d in replayed.values())
+    # so replay differs from live in those fields at the second result only
+    differences = replay_check_differences(frames["replayed"], frames["recorded"])
+    rows = records(differences)
+    assert {(row["step_id"], row["stage"]) for row in rows} == {
+        (f"{second}/a", "tool_result")
+    }
+    assert {f"step.{f}" for f in MODEL_CALL_FIELDS} <= {row["field"] for row in rows}
