@@ -6,7 +6,8 @@
 #       return await context.host.score(step, DIMENSIONS, preprocessor=StepPreprocessor(
 #           input_window=LastTurns(6),                      # the last 6 turns the model was sent
 #           omit_reasoning=True,                            # without the model's reasoning
-#           transform=withhold_flagged,                     # anything else, on the thinned step
+#           hide_messages=lambda m: (m.metadata or {}).get("red_team") is True,  # marked where they were
+#           transform=paraphrased,                          # anything else, on the thinned step
 #       ))
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, cast
 from inspect_ai.model import (
     ChatMessage,
     ChatMessageAssistant,
+    ChatMessageUser,
     Content,
     ContentReasoning,
     ContentText,
@@ -34,6 +36,7 @@ from ._step import (
     AfterToolCall,
     BeforeGenerate,
     BeforeToolCall,
+    HiddenMessages,
     Step,
     Truncation,
 )
@@ -104,7 +107,7 @@ Window: TypeAlias = AllMessages | LastTurns | LastMessages | NewSinceLastReport
 class StepPreprocessor(Generic[S]):
     """What a monitor shows a model about a step.
 
-    `preprocess_step()` applies it, in this order: the windows to `input`, `history` and `agent_messages`, then the omissions to every message the step holds (`omit_assistant_text` also leaves out an assistant message it empties), then `transform`, which sees the result. By default `input` is shown whole, while `history` and `agent_messages` are omitted, even when the host could not provide them, so a default prompt is the same live and in replay. A scaffold may keep hidden instructions out of its own list but send them in `input` and `history`. To omit the request lists and show the agent's own list, use `StepPreprocessor(input_window=None, history_window=None, agent_messages_window=AllMessages())`; this requires the conversation-owning scaffold to be the outermost `@agent` agent function. Other stage content remains: every stage renders the request's tools and tool choice while `input` is known (a tool stage's are the producing request's); `AfterGenerate` renders the reply, including reasoning by default before the scaffold has curated it; both tool stages render the assistant text (unless `omit_assistant_text`) and call; and `AfterToolCall` renders the result. Strict blindness also needs a stage-specific `transform` or a custom prompt that curates these surfaces; a transform can clear `tools` and `tool_choice`.
+    `preprocess_step()` applies it, in this order: `hide_messages` to every message the step holds except assistant messages, then the windows to `input`, `history` and `agent_messages`, then the omissions to every message the step holds (`omit_assistant_text` also leaves out an assistant message it empties), then `transform`, which sees the result. By default `input` is shown whole, while `history` and `agent_messages` are omitted, even when the host could not provide them, so a default prompt is the same live and in replay. A scaffold may keep hidden instructions out of its own list but send them in `input` and `history`. To omit the request lists and show the agent's own list, use `StepPreprocessor(input_window=None, history_window=None, agent_messages_window=AllMessages())`; this requires the conversation-owning scaffold to be the outermost `@agent` agent function. Other stage content remains: every stage renders the request's tools and tool choice while `input` is known (a tool stage's are the producing request's); `AfterGenerate` renders the reply, including reasoning by default before the scaffold has curated it; both tool stages render the assistant text (unless `omit_assistant_text`) and call; and `AfterToolCall` renders the result. Strict blindness also needs a stage-specific `transform` or a custom prompt that curates these surfaces; a transform can clear `tools` and `tool_choice`.
     """
 
     input_window: Window | None = field(default_factory=AllMessages)
@@ -135,6 +138,16 @@ class StepPreprocessor(Generic[S]):
 
     Text the agent's model wrote can still reach the monitor model elsewhere: in tool call arguments (such as a `think()` call or a comment in a command), in compaction summaries (user messages), and in results returned by sub-agents or tools."""
 
+    hide_messages: Callable[[ChatMessage], bool] | None = None
+    """Hide the messages for which this returns True, always leaving a marker line where they were, so the monitor model can tell that something was hidden (unlike the `omit_` options, which leave content out silently).
+
+    It is for a deployment that keeps messages it has flagged from the monitor, such as a red-team instruction the agent is given in a control eval: `hide_messages=lambda m: (m.metadata or {}).get("red_team") is True`. The marker counts the messages and says nothing else of them, as `[2 messages hidden (3f9a1c7e)]` with a nonce; consecutive hidden messages share one marker. It is asked only about the messages that come into the conversation, system, user and tool messages, and never about an assistant message: the agent's replies and tool calls, including a tool stage's call and a generate's reply, are always shown, so the agent cannot use it to hide what it does. It applies before the windows, so a hidden message does not count toward `LastTurns(n)` or `LastMessages(n)`, to `input`, `history` and `agent_messages`, and to an `AfterToolCall` step's result, which is then rendered as the marker after its call, still shown. It also applies to the task `Host.score` shows, the sample's input (a string input is tested as one user message). A system message `omit_system` leaves out is left out without a marker. `preprocess_step()` records what was hidden in the step's `hidden`.
+
+    In the thinned lists, each run of hidden messages is a placeholder user message, with no id, whose text is the marker without a nonce; `step_as_str()` renders it as the marker, and a `transform` that keeps it keeps the marker where it is. A step thinned again keeps what was hidden, and `Host.score` hides from the task what any of the preprocessings applied to it would hide.
+
+    Match on something the agent cannot write, such as metadata the eval sets on its own messages. A match on text also lets the agent get a tool result or a user message it wrote (such as a sub-agent's prompt) hidden, behind a genuine marker, by making it contain that text. It is given the host's own messages: it must not change them. With it set, every message of each windowed list is read at every step, even under `NewSinceLastReport`.
+    """
+
     transform: Callable[[S], Awaitable[S]] | None = None
     """Any further change, applied last to the thinned step. It returns a step of the same type. The messages it is given are the host's own objects: copy one before changing it."""
 
@@ -144,7 +157,7 @@ async def preprocess_step(
 ) -> S:
     """`step`, thinned as `preprocessor` says (`StepPreprocessor()` when None).
 
-    Each window cuts its list as it is. A list with no window becomes `[]`, even one the host could not provide; a windowed list the host could not provide stays None. The omissions apply to `input`, `history`, `agent_messages`, a tool call's assistant text, assistant message and result, and a generate's reply.
+    Each window cuts its list as it is, less what `hide_messages` hides. A list with no window becomes `[]`, even one the host could not provide; a windowed list the host could not provide stays None. The omissions apply to `input`, `history`, `agent_messages`, a tool call's assistant text, assistant message and result, and a generate's reply. What `hide_messages` hid is recorded in the returned step's `hidden`, with what a step given already thinned had hidden; it is None when no `hide_messages` was applied.
 
     Args:
         step: The step a monitor was given.
@@ -154,6 +167,10 @@ async def preprocess_step(
         RuntimeError: If a window is `NewSinceLastReport` and this is called outside a monitor or protocol function the runner is running.
     """
     p = preprocessor or StepPreprocessor()
+    hide = p.hide_messages
+    # what a step given already thinned had hidden, which stays hidden; its
+    # lists hold the placeholders that stand for its hidden messages
+    before = step.hidden
 
     def thin(
         source: _Source,
@@ -166,14 +183,33 @@ async def preprocess_step(
             return []
         if messages is None:
             return None
+        # hidden over the whole list before the window, so a hidden message
+        # counts toward no window, and a result whose call is outside the
+        # window is still hidden with its call
+        if hide is not None or before is not None:
+            messages = _placed(messages, hide, p.omit_system)
         return _omitted(_cut(step, source, messages, window), p)
 
+    input = thin("input", step.input, p.input_window)
+    history = thin("history", step.history, p.history_window)
+    agent_messages = thin(
+        "agent_messages", step.agent_messages, p.agent_messages_window
+    )
+    was = HiddenMessages() if before is None else before
+    # the step's own call and reply are the agent's, so only its result can
+    # be hidden
+    result = hide is not None and isinstance(step, AfterToolCall) and hide(step.result)
     thinned = replace(
         step,
-        input=thin("input", step.input, p.input_window),
-        history=thin("history", step.history, p.history_window),
-        agent_messages=thin(
-            "agent_messages", step.agent_messages, p.agent_messages_window
+        input=input,
+        history=history,
+        agent_messages=agent_messages,
+        hidden=None
+        if hide is None and before is None
+        else HiddenMessages(
+            ids=tuple(dict.fromkeys([*was.ids, *_ids(input, history, agent_messages)])),
+            result=result or was.result,
+            filters=(*was.filters, *([] if hide is None else [hide])),
         ),
     )
     if isinstance(thinned, AfterToolCall):
@@ -187,7 +223,7 @@ async def preprocess_step(
             thinned = replace(thinned, assistant_message=made)
     if isinstance(thinned, AfterGenerate):
         thinned = replace(thinned, output=_omitted_output(thinned.output, p))
-    return await p.transform(thinned) if p.transform else thinned
+    return await p.transform(thinned) if p.transform is not None else thinned
 
 
 async def step_as_str(
@@ -195,11 +231,11 @@ async def step_as_str(
 ) -> tuple[str, ExtractReferences]:
     """Render `step` for a monitor's prompt, numbering its messages `[M1]`, `[M2]` and so on, and return the text with a function that turns those cites in a model's answer into references.
 
-    Everything is in one block, marked `[BEGIN AGENT STEP - ...]` and `[END AGENT STEP - ...]` and named for the stage: `TOOL CALL REQUEST` before a tool call, `TOOL CALL RESULT` after one, `MODEL REQUEST` before a generate, and `MODEL REPLY` after one. Inside it are blocks between `[BEGIN ...]` and `[END ...]` lines, each left out when it is empty. At every stage: `HISTORY` (`step.history`, every message the agent has sent its model), `AGENT MESSAGES` (`step.agent_messages`, the outermost running agent function's own message list, which its scaffold may curate), then the model request, as `INPUT`, `TOOLS` (the tools offered, as JSON) and a one-line `[TOOL CHOICE] "auto"`; at a tool stage, the request that produced the call. Then after a generate, `REPLY`; at a tool stage, `CALL` (the assistant's text and the call) and, after the call, `RESULT`. When the host cut the tool's output before the agent's model saw it (`step.truncated` is a `Truncation`), `RESULT` opens with a line such as `[OUTPUT TRUNCATED] The tool's output was 48,210 bytes; the agent's model was shown at most its first 8,192 and last 8,192 bytes, with the middle left out.`; a result the host did not cut, or cannot tell about (`None`, as in a replay from messages), has no such line. A list the host could not provide (None) is named in its block (`preprocess_step()` leaves a list with no window empty, so only a windowed one is named); at a tool stage whose input is not known, the tools and tool choice are left out. With a `nonce`, every `[BEGIN ...]` and `[END ...]` line, and the `[TOOL CHOICE]` and `[OUTPUT TRUNCATED]` lines, carries it in parentheses, as `[BEGIN INPUT (3f9a1c7e)]`, and so does every message header. Everything rendered was written by or shown to the agent under observation, so treat it as untrusted in the prompt around it.
+    Everything is in one block, marked `[BEGIN AGENT STEP - ...]` and `[END AGENT STEP - ...]` and named for the stage: `TOOL CALL REQUEST` before a tool call, `TOOL CALL RESULT` after one, `MODEL REQUEST` before a generate, and `MODEL REPLY` after one. Inside it are blocks between `[BEGIN ...]` and `[END ...]` lines, each left out when it is empty. At every stage: `HISTORY` (`step.history`, every message the agent has sent its model), `AGENT MESSAGES` (`step.agent_messages`, the outermost running agent function's own message list, which its scaffold may curate), then the model request, as `INPUT`, `TOOLS` (the tools offered, as JSON) and a one-line `[TOOL CHOICE] "auto"`; at a tool stage, the request that produced the call. Then after a generate, `REPLY`; at a tool stage, `CALL` (the assistant's text and the call) and, after the call, `RESULT`. When the host cut the tool's output before the agent's model saw it (`step.truncated` is a `Truncation`), `RESULT` opens with a line such as `[OUTPUT TRUNCATED] The tool's output was 48,210 bytes; the agent's model was shown at most its first 8,192 and last 8,192 bytes, with the middle left out.`; a result the host did not cut, or cannot tell about (`None`, as in a replay from messages), has no such line. Messages that `StepPreprocessor.hide_messages` hid are one marker line per run where they stood, such as `[2 messages hidden]`, which takes no message number; a hidden result of the step's own call is that marker in the RESULT block, after the call. A list the host could not provide (None) is named in its block (`preprocess_step()` leaves a list with no window empty, so only a windowed one is named); at a tool stage whose input is not known, the tools and tool choice are left out. With a `nonce`, every `[BEGIN ...]` and `[END ...]` line, the `[TOOL CHOICE]` and `[OUTPUT TRUNCATED]` lines and every hidden-messages marker carry it in parentheses, as `[BEGIN INPUT (3f9a1c7e)]`, and so does every message header. Everything rendered was written by or shown to the agent under observation, so treat it as untrusted in the prompt around it.
 
     Args:
         step: The step to render, usually from `preprocess_step()`.
-        nonce: A code the agent cannot guess, such as `secrets.token_hex(4)`, for every block marker and message header and the `[TOOL CHOICE]` and `[OUTPUT TRUNCATED]` lines; none by default. Scout needs at least 8 characters.
+        nonce: A code the agent cannot guess, such as `secrets.token_hex(4)`, for every block marker and message header, the `[TOOL CHOICE]` and `[OUTPUT TRUNCATED]` lines and every hidden-messages marker; none by default. Scout needs at least 8 characters.
     """
     return await render_step(step, nonce=nonce, cut={})
 
@@ -212,9 +248,10 @@ HeadCut: TypeAlias = Mapping[_Source, int]
 _CUT_ORDER: tuple[_Source, ...] = ("history", "agent_messages", "input")
 
 
-def _shown(step: Step, source: _Source) -> Sequence[ChatMessage]:
+def _shown(step: Step, source: _Source) -> list[ChatMessage]:
+    # the messages a list shows, without the placeholders for hidden ones
     messages: Sequence[ChatMessage] | None = getattr(step, source)
-    return messages or []
+    return [m for m in messages or [] if not isinstance(m, _Hidden)]
 
 
 def _cuttable_in(step: Step, source: _Source) -> int:
@@ -263,17 +300,33 @@ async def render_step(
     )
 
     mark = "" if nonce is None else f" ({nonce})"
+    hidden = HiddenMessages() if step.hidden is None else step.hidden
+
+    def hidden_marker(count: int) -> str:
+        return f"{hidden_line(count, nonce)}\n"
 
     async def text(messages: Sequence[ChatMessage] | None, unknown: str) -> str:
         if messages is None:
             return unknown
-        if not messages:
-            return ""
-        # Scout renders a list; a view becomes one only here, where every
-        # message is rendered anyway
-        return await numbered(
-            messages if isinstance(messages, list) else list(messages)
-        )
+        # placeholders are one marker line where their hidden messages stood
+        # (two are adjacent once an omitted system message between them is
+        # gone); the marker takes no message number, and the numbering runs
+        # on across it, so each cite still resolves to the message it names
+        parts: list[str] = []
+        shown: list[ChatMessage] = []
+        hidden = 0
+        for message in [*messages, None]:
+            if shown and (message is None or isinstance(message, _Hidden)):
+                parts.append(await numbered(shown))
+                shown = []
+            if hidden and not isinstance(message, _Hidden):
+                parts.append(hidden_marker(hidden))
+                hidden = 0
+            if isinstance(message, _Hidden):
+                hidden += len(message.hidden_ids)
+            elif message is not None:
+                shown.append(message)
+        return "\n".join(parts)
 
     async def listed(
         source: _Source, messages: Sequence[ChatMessage] | None, unknown: str
@@ -285,11 +338,20 @@ async def render_step(
         if messages is None:
             return unknown
         dropped = cut.get(source, 0)
-        kept = await text(list(messages)[dropped:], unknown)
         if not dropped:
-            return kept
+            return await text(messages, unknown)
+        # the placeholders among the dropped messages, and those just after
+        # them, go with them
+        messages = list(messages)
+        start = 0
+        while dropped and start < len(messages):
+            dropped -= not isinstance(messages[start], _Hidden)
+            start += 1
+        while start < len(messages) and isinstance(messages[start], _Hidden):
+            start += 1
+        kept = await text(messages[start:], unknown)
         marker = (
-            f"[{dropped} earlier messages left out to fit the context window{mark}]"
+            f"[{cut[source]} earlier messages left out to fit the context window{mark}]"
         )
         return f"{marker}\n{kept}" if kept else marker
 
@@ -346,15 +408,13 @@ async def render_step(
     elif isinstance(step, BeforeToolCall | AfterToolCall):
         parts.append(blocks(("CALL", await text([_call(step)], ""))))
         if isinstance(step, AfterToolCall):
-            parts.append(
-                blocks(
-                    (
-                        "RESULT",
-                        _truncation(step.truncated, mark)
-                        + await text([step.result], ""),
-                    )
-                )
+            # a hidden result is its marker, after the call it answers
+            result = (
+                hidden_marker(1)
+                if hidden.result
+                else _truncation(step.truncated, mark) + await text([step.result], "")
             )
+            parts.append(blocks(("RESULT", result)))
     return (
         blocks(
             (
@@ -363,6 +423,36 @@ async def render_step(
             )
         ),
         extract_refs,
+    )
+
+
+def hidden_line(count: int, nonce: str | None) -> str:
+    # the marker for a run of hidden messages, in fixed wording that never
+    # holds message text, with the nonce when there is one
+    mark = "" if nonce is None else f" ({nonce})"
+    return f"[{count} message{'' if count == 1 else 's'} hidden{mark}]"
+
+
+def task_text(
+    sample_input: str | Sequence[ChatMessage],
+    filters: Sequence[Callable[[ChatMessage], bool]],
+    nonce: str | None,
+) -> str:
+    # the sample's input as `Host.score` shows it: its messages' text joined
+    # with newlines, each run of messages any filter matches a marker line in
+    # its place. A string input is tested as the user message it becomes
+    messages = (
+        [ChatMessageUser(content=sample_input)]
+        if isinstance(sample_input, str)
+        else sample_input
+    )
+
+    def hide(message: ChatMessage) -> bool:
+        return any(hides(message) for hides in filters)
+
+    return "\n".join(
+        hidden_line(len(m.hidden_ids), nonce) if isinstance(m, _Hidden) else m.text
+        for m in _placed(messages, hide, False)
     )
 
 
@@ -385,14 +475,20 @@ def _cut(
     # a window reads the list it is given as it is and slices off what it
     # keeps; `AllMessages` keeps it whole, and the others read from where
     # what they keep starts, except for `NewSinceLastReport` over `input` or
-    # `agent_messages`, which a scaffold can rewrite, so it scans them
+    # `agent_messages`, which a scaffold can rewrite, so it scans them. A
+    # placeholder for hidden messages is not counted (it is not an
+    # assistant message, so `LastTurns` passes it by)
     match window:
         case AllMessages():
             return messages
         case LastTurns(n):
             return messages[_turns_start(messages, n) :]
         case LastMessages(n):
-            return messages[len(messages) - min(n, len(messages)) :]
+            start = len(messages)
+            while n and start:
+                start -= 1
+                n -= not isinstance(messages[start], _Hidden)
+            return messages[start:]
         case NewSinceLastReport(context):
             return _after_mark(context, step, source, messages)
 
@@ -410,6 +506,65 @@ def _turns_start(messages: Sequence[ChatMessage], n: int) -> int:
             n -= 1
             start = i
     return 0
+
+
+class _Hidden(ChatMessageUser):
+    # the placeholder for a run of hidden messages, where they stood in a
+    # thinned list: windows skip it, and `render_step` renders it as the
+    # nonce-marked marker. Its text is the marker without a nonce, for a
+    # renderer that does not know it
+    hidden_ids: tuple[str | None, ...]
+
+
+def _placeholder(ids: Sequence[str | None]) -> _Hidden:
+    placeholder = _Hidden(content=hidden_line(len(ids), None), hidden_ids=tuple(ids))
+    # no id, so `NewSinceLastReport` never records it as the last message shown
+    placeholder.id = None
+    return placeholder
+
+
+def _ids(*lists: list[ChatMessage] | None) -> list[str]:
+    # the ids of the hidden messages the placeholders in the lists stand for
+    return [
+        id
+        for messages in lists
+        for m in messages or []
+        if isinstance(m, _Hidden)
+        for id in m.hidden_ids
+        if id is not None
+    ]
+
+
+def _placed(
+    messages: Sequence[ChatMessage],
+    hide: Callable[[ChatMessage], bool] | None,
+    omit_system: bool,
+) -> list[ChatMessage]:
+    # the messages with each run of hidden ones, and of placeholders for
+    # some, replaced by one placeholder. `hide` is never asked about an
+    # assistant message, which the agent's model wrote; a system message
+    # `omit_system` leaves out is not hidden, so it leaves no marker
+    placed: list[ChatMessage] = []
+    run: list[str | None] = []
+    for message in messages:
+        if isinstance(message, _Hidden):
+            run.extend(message.hidden_ids)
+            continue
+        if (
+            hide is not None
+            and not isinstance(message, ChatMessageAssistant)
+            and not (omit_system and message.role == "system")
+            and hide(message)
+        ):
+            run.append(message.id)
+            continue
+        if run:
+            placed.append(_placeholder(run))
+            run = []
+        placed.append(message)
+    if run:
+        placed.append(_placeholder(run))
+    return placed
 
 
 def _after_mark(
