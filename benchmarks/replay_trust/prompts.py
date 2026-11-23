@@ -37,9 +37,10 @@ _NONCE = re.compile(r"^\[BEGIN .* \(([0-9a-f]{8})\)\]$", re.MULTILINE)
 # where Host.score and Scout write the nonce, with `{n}` for it: block markers,
 # the left-out, hidden-messages, tool choice and output truncated marker lines,
 # message headers (an uppercased role label), tool call, tool use and tool error
-# lines, reasoning and prefill tags, and the default template's sentence naming
-# it. Each nonce is a group, and only those are replaced, so the same characters
-# elsewhere stay as they were
+# lines, reasoning, prefill and compaction summary tags, placeholders for content that is not text
+# (which the default template also names), and the default template's sentence
+# naming it. Each nonce is a group, and only those are replaced, so the same
+# characters elsewhere stay as they were
 _MARKS = [
     r"^\[(?:BEGIN|END) .* \(({n})\)\]$",
     r"^\[\d+ earlier messages left out to fit the context window \(({n})\)\]$",
@@ -49,7 +50,9 @@ _MARKS = [
     r"^Tool (?:Call|Use) \(({n})\): ",
     r"^Error in tool call .* \(({n})\):$",
     r"<(?:/?(?:thinking|thinking_summary|prefill) ({n})|thinking_redacted ({n})/)>",
+    r"</?compaction_summary ({n})>",
     r"^\[OUTPUT TRUNCATED \(({n})\)\] ",
+    r"<[a-z_]+ ({n}) />",
     r'^The following markers in this prompt contain the code \(({n})\): block markers such as "\[BEGIN INPUT \(({n})\)\]", message headers such as "\[M1\] USER \(({n})\):", the "\[TOOL CHOICE \(({n})\)\]" and "\[OUTPUT TRUNCATED \(({n})\)\]" lines, lines such as "\[2 messages hidden \(({n})\)\]", and a line saying how many earlier messages were left out to fit your context window\.',
 ]
 
