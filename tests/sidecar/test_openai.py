@@ -3,9 +3,13 @@ import json
 from dataclasses import replace
 from typing import Any, cast
 
-import inspect_ai.model._internal
 import pytest
-from inspect_ai.model import ChatMessageAssistant, ChatMessageTool, ContentReasoning
+from inspect_ai.model import (
+    ChatMessageAssistant,
+    ChatMessageTool,
+    ContentReasoning,
+    ContentText,
+)
 from inspect_ai.util import StoreModel
 
 from inspect_sentinel._context import Context
@@ -971,7 +975,7 @@ def _internal(value: Any) -> str:
     return f"<content-internal>{encoded}</content-internal>"
 
 
-# a span inspect_ai reads, then one it would drop unread
+# a span inspect_ai reads, then a marker that isn't one, which it reads as text
 _TWO_SPANS = (
     f"Rain. {_internal({'id': 1})} <content-internal>A storm.</content-internal>"
 )
@@ -1003,48 +1007,6 @@ def _chat_result(*parts: str) -> dict[str, Any]:
 
 def _chat_said(*then: dict[str, Any]) -> dict[str, Any]:
     return openai_request("chat", then=list(then)) | {"model": "gpt-test"}
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "body",
-    [
-        pytest.param(_chat_result("Rain.", _TWO_SPANS), id="chat, a tool result"),
-        pytest.param(
-            _chat_said({"role": "assistant", "content": _TWO_SPANS}),
-            id="chat, an assistant's text",
-        ),
-        pytest.param(
-            _chat_said(
-                {"role": "user", "content": [{"type": "text", "text": _TWO_SPANS}]}
-            ),
-            id="chat, a user's text part",
-        ),
-        pytest.param(
-            _chat_said({"role": "user", "content": [{"text": _TWO_SPANS}]}),
-            id="chat, a user's text part written as text alone",
-        ),
-        pytest.param(
-            {"model": "gpt-test", "input": [{"role": "user", "content": "Hi"}]}
-            | {
-                "input": [
-                    {"role": "user", "content": "Hi"},
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": _TWO_SPANS}],
-                    },
-                ]
-            },
-            id="responses, an assistant's text",
-        ),
-    ],
-)
-async def test_a_request_with_text_inspect_ai_would_drop_is_unreadable(
-    body: dict[str, Any],
-) -> None:
-    with pytest.raises(UnreadableError, match="more than one <content-internal>"):
-        await read_request("openai", json.dumps(body).encode())
 
 
 def _write_file(text: str, call: str = "call_1") -> dict[str, Any]:
@@ -1085,6 +1047,35 @@ def _write_file(text: str, call: str = "call_1") -> dict[str, Any]:
                 "input": _result_parts({"type": "input_text", "text": _TWO_SPANS}),
             },
             id="responses, a tool result",
+        ),
+        pytest.param(_chat_result("Rain.", _TWO_SPANS), id="chat, a tool result"),
+        pytest.param(
+            _chat_said({"role": "assistant", "content": _TWO_SPANS}),
+            id="chat, an assistant's text",
+        ),
+        pytest.param(
+            _chat_said(
+                {"role": "user", "content": [{"type": "text", "text": _TWO_SPANS}]}
+            ),
+            id="chat, a user's text part",
+        ),
+        pytest.param(
+            _chat_said({"role": "user", "content": [{"text": _TWO_SPANS}]}),
+            id="chat, a user's text part written as text alone",
+        ),
+        pytest.param(
+            {"model": "gpt-test", "input": [{"role": "user", "content": "Hi"}]}
+            | {
+                "input": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": _TWO_SPANS}],
+                    },
+                ]
+            },
+            id="responses, an assistant's text",
         ),
     ],
 )
@@ -1289,17 +1280,20 @@ def _encoded(json_text: str) -> str:
         pytest.param('{"id": "msg_1"}', '{"id": "msg_1"}', True, id="a refusal"),
     ],
 )
-async def test_two_assistant_texts_with_one_internal_value_are_unreadable(
+async def test_two_assistant_texts_with_one_internal_value_are_read(
     first: str, second: str, refusal: bool
 ) -> None:
-    dangerous = f"A dangerous storm. {_encoded(first)}"
+    dangerous = f"A dangerous storm.\n{_encoded(first)}"
     body = _assistant_said(
         {"type": "refusal", "refusal": dangerous} if refusal else dangerous,
-        f"A quiet day. {_encoded(second)}",
+        f"A quiet day.\n{_encoded(second)}",
     )
 
-    with pytest.raises(UnreadableError, match="same <content-internal> value"):
-        await read_request("openai", body)
+    messages = await read_request("openai", body)
+
+    said = " ".join(m.text for m in messages if m.role == "assistant")
+    assert "A dangerous storm." in said
+    assert "A quiet day." in said
 
 
 @pytest.mark.anyio
@@ -1658,36 +1652,7 @@ def test_a_namespace_with_a_tool_that_cannot_be_read_is_unreadable() -> None:
         offered("openai", json.dumps(body).encode())
 
 
-_ONE_SPAN = f"Rain. {_internal({'secret': 'A storm.'})}"
-
-# inspect_ai's readers drop the value of a span in an assistant string, or of a
-# span with no text, until they read every span into a part of its own
-# (inspect_ai#5553), and the sidecar refuses a request whose value they drop
-_READERS_KEEP_A_SPAN_ALONE = hasattr(
-    inspect_ai.model._internal, "parse_content_with_internal_blocks"
-)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "said",
-    [
-        pytest.param(
-            {"role": "assistant", "content": f"<think>Hmm.</think>{_ONE_SPAN}"},
-            id="a string with reasoning",
-        ),
-        pytest.param(
-            {"role": "assistant", "content": [{"type": "text", "text": _ONE_SPAN}]},
-            id="a text part",
-        ),
-    ],
-)
-async def test_an_assistant_text_whose_internal_value_is_kept_is_read(
-    said: dict[str, Any],
-) -> None:
-    messages = await read_request("openai", json.dumps(_chat_said(said)).encode())
-
-    assert "A storm." in json.dumps([m.model_dump(mode="json") for m in messages])
+_ONE_SPAN = f"Rain.\n{_internal({'secret': 'A storm.'})}"
 
 
 @pytest.mark.anyio
@@ -1712,6 +1677,57 @@ async def test_a_merge_that_overwrites_an_earlier_refusal_is_unreadable() -> Non
         ),
         pytest.param(
             _chat_said(
+                {"role": "assistant", "content": f"<think>Hmm.</think>{_ONE_SPAN}"}
+            ),
+            id="chat, a string with reasoning",
+        ),
+        pytest.param(
+            _chat_said(
+                {"role": "assistant", "content": [{"type": "text", "text": _ONE_SPAN}]}
+            ),
+            id="chat, a text part",
+        ),
+        pytest.param(
+            _chat_said(
+                {
+                    "role": "assistant",
+                    "content": f"<think>Hmm.</think>A.<think>More.</think>{_ONE_SPAN}",
+                }
+            ),
+            id="chat, a string with two reasonings",
+        ),
+        pytest.param(
+            _chat_said(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": f"<think>Hmm.</think>{_ONE_SPAN}"}
+                    ],
+                }
+            ),
+            id="chat, a text part with reasoning",
+        ),
+        pytest.param(
+            {
+                "model": "gpt-test",
+                "input": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": f"<think>Hmm.</think>{_ONE_SPAN}",
+                            }
+                        ],
+                    },
+                ],
+            },
+            id="responses, a text with reasoning",
+        ),
+        pytest.param(
+            _chat_said(
                 {"role": "assistant", "content": f"<think>Hmm.</think>{_ONE_SPAN[6:]}"}
             ),
             id="chat, reasoning and a span alone",
@@ -1732,14 +1748,9 @@ async def test_a_merge_that_overwrites_an_earlier_refusal_is_unreadable() -> Non
         ),
     ],
 )
-async def test_an_internal_value_is_kept_or_the_request_is_unreadable(
+async def test_an_assistant_texts_internal_value_is_kept(
     body: dict[str, Any],
 ) -> None:
-    if not _READERS_KEEP_A_SPAN_ALONE:
-        with pytest.raises(UnreadableError, match="would be dropped unread"):
-            await read_request("openai", json.dumps(body).encode())
-        return
-
     messages = await read_request("openai", json.dumps(body).encode())
 
     assert {"secret": "A storm."} in [
@@ -1995,3 +2006,42 @@ async def test_a_retried_request_may_be_handed_the_same_call_again() -> None:
     answer = await handler.request(_chat_asked("b", _CALLED, _RESULT))
 
     assert answer == Pass()
+
+
+_TWO_VALUES = f"Rain.\n{_internal({'id': 1})}\nHail.\n{_internal({'id': 2})}"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            _chat_said({"role": "assistant", "content": _TWO_VALUES}),
+            id="chat, a string",
+        ),
+        pytest.param(
+            {
+                "model": "gpt-test",
+                "input": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": _TWO_VALUES}],
+                    },
+                ],
+            },
+            id="responses, a text",
+        ),
+    ],
+)
+async def test_a_text_with_two_internal_values_is_read_as_two_parts(
+    body: dict[str, Any],
+) -> None:
+    messages = await read_request("openai", json.dumps(body).encode())
+
+    assert [
+        (part.text, part.internal)
+        for part in messages[-1].content
+        if isinstance(part, ContentText)
+    ] == [("Rain.", {"id": 1}), ("Hail.", {"id": 2})]
