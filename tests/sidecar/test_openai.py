@@ -3,6 +3,7 @@ import json
 from dataclasses import replace
 from typing import Any, cast
 
+import inspect_ai.model._internal
 import pytest
 from inspect_ai.model import ChatMessageAssistant, ChatMessageTool, ContentReasoning
 from inspect_ai.util import StoreModel
@@ -1111,7 +1112,8 @@ async def test_a_chat_reply_is_read_whole() -> None:
 
 @pytest.mark.anyio
 async def test_an_item_written_into_its_text_by_inspect_ai_is_read() -> None:
-    body = _chat_result(f"Rain. {_internal({'id': 1})}")
+    # a newline before the span, as inspect_ai writes one
+    body = _chat_result(f"Rain.\n{_internal({'id': 1})}")
 
     messages = await read_request("openai", json.dumps(body).encode())
 
@@ -1302,8 +1304,8 @@ async def test_two_assistant_texts_with_one_internal_value_are_unreadable(
 
 @pytest.mark.anyio
 async def test_one_assistant_text_sent_twice_is_read_once() -> None:
-    once = "A quiet day. " + _encoded('{"id": "msg_1"}')
-    again = "A quiet day. " + _encoded('{"id":"msg_1"}')
+    once = "A quiet day.\n" + _encoded('{"id": "msg_1"}')
+    again = "A quiet day.\n" + _encoded('{"id":"msg_1"}')
 
     messages = await read_request("openai", _assistant_said(once, again))
 
@@ -1419,8 +1421,8 @@ async def test_a_custom_call_is_judged_apart_from_a_function_call_like_it() -> N
 async def test_texts_with_one_internal_value_in_different_turns_are_read() -> None:
     body = json.loads(
         _assistant_said(
-            f"A dangerous storm. {_internal({'id': 'msg_1'})}",
-            f"A quiet day. {_internal({'id': 'msg_1'})}",
+            f"A dangerous storm.\n{_internal({'id': 'msg_1'})}",
+            f"A quiet day.\n{_internal({'id': 'msg_1'})}",
         )
     )
     # a user message between the two ends the first turn
@@ -1658,15 +1660,12 @@ def test_a_namespace_with_a_tool_that_cannot_be_read_is_unreadable() -> None:
 
 _ONE_SPAN = f"Rain. {_internal({'secret': 'A storm.'})}"
 
-
-@pytest.mark.anyio
-async def test_an_assistant_string_whose_internal_value_is_dropped_is_unreadable() -> (
-    None
-):
-    body = _chat_said({"role": "assistant", "content": _ONE_SPAN})
-
-    with pytest.raises(UnreadableError, match="would be dropped unread"):
-        await read_request("openai", json.dumps(body).encode())
+# inspect_ai's readers drop the value of a span in an assistant string, or of a
+# span with no text, until they read every span into a part of its own
+# (inspect_ai#5553), and the sidecar refuses a request whose value they drop
+_READERS_KEEP_A_SPAN_ALONE = hasattr(
+    inspect_ai.model._internal, "parse_content_with_internal_blocks"
+)
 
 
 @pytest.mark.anyio
@@ -1708,6 +1707,10 @@ async def test_a_merge_that_overwrites_an_earlier_refusal_is_unreadable() -> Non
     "body",
     [
         pytest.param(
+            _chat_said({"role": "assistant", "content": _ONE_SPAN}),
+            id="chat, a string",
+        ),
+        pytest.param(
             _chat_said(
                 {"role": "assistant", "content": f"<think>Hmm.</think>{_ONE_SPAN[6:]}"}
             ),
@@ -1729,11 +1732,22 @@ async def test_a_merge_that_overwrites_an_earlier_refusal_is_unreadable() -> Non
         ),
     ],
 )
-async def test_an_internal_value_read_into_no_part_is_unreadable(
+async def test_an_internal_value_is_kept_or_the_request_is_unreadable(
     body: dict[str, Any],
 ) -> None:
-    with pytest.raises(UnreadableError, match="would be dropped unread"):
-        await read_request("openai", json.dumps(body).encode())
+    if not _READERS_KEEP_A_SPAN_ALONE:
+        with pytest.raises(UnreadableError, match="would be dropped unread"):
+            await read_request("openai", json.dumps(body).encode())
+        return
+
+    messages = await read_request("openai", json.dumps(body).encode())
+
+    assert {"secret": "A storm."} in [
+        part.internal
+        for m in messages
+        if not isinstance(m.content, str)
+        for part in m.content
+    ]
 
 
 @pytest.mark.anyio
