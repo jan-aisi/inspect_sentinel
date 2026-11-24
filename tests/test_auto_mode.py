@@ -209,23 +209,32 @@ async def test_the_category_is_the_deny_rule_the_first_line_names(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("rules", "named", "category"),
+    ("rules", "line", "category"),
     [
         # a name with punctuation of its own is matched as configured first
-        (["Custom rule.: Detaches a process."], "Custom rule.", "Custom rule."),
-        (["Custom rule.: Detaches a process."], "`custom rule.`", "Custom rule."),
+        (["Custom rule.: Detaches a process."], "Rule: Custom rule.", "Custom rule."),
+        (["Custom rule.: Detaches a process."], "Rule: `custom rule.`", "Custom rule."),
         # two names that differ only in formatting are told apart exactly,
         # and left unmatched when only formatting would match them
-        (["Detach: One.", "Detach.: Two."], "Detach.", "Detach."),
-        (["Detach: One.", "Detach.: Two."], "detach", None),
+        (["Detach: One.", "Detach.: Two."], "Rule: Detach.", "Detach."),
+        (["Detach: One.", "Detach.: Two."], "Rule: detach", None),
+        # a name with literal Markdown is kept, plain or after a bold label,
+        # and so is a name that differs from it only by that Markdown
+        (["**Detach**: One.", "Detach: Two."], "Rule: **Detach**", "**Detach**"),
+        (["**Detach**: One.", "Detach: Two."], "Rule: Detach", "Detach"),
+        (["**Detach**: One.", "Detach: Two."], "**Rule:** **Detach**", "**Detach**"),
+        (["**Detach**: One.", "Detach: Two."], "**Rule:** Detach", "Detach"),
+        (["**Detach: One.", "Detach: Two."], "Rule: **Detach", "**Detach"),
+        (["**Detach: One.", "Detach: Two."], "Rule: Detach", "Detach"),
+        (["**Detach: One.", "Detach: Two."], "**Rule:** Detach", "Detach"),
     ],
 )
 async def test_a_configured_name_is_matched_exactly_before_formatting_is_ignored(
-    rules: list[str], named: str, category: str | None
+    rules: list[str], line: str, category: str | None
 ) -> None:
     policy = AutoModePolicy(hard_deny=[], soft_deny=rules)
     observation = await judge(
-        host(answer(f"Rule: {named}\nDetached.", 0.7)), auto_mode(policy)
+        host(answer(f"{line}\nDetached.", 0.7)), auto_mode(policy)
     )
     assert observation.metadata is not None
     assert observation.metadata["category"] == category

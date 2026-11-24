@@ -127,9 +127,15 @@ def _with_category(
     lines = (observation.explanation or "").strip().splitlines()
     first = lines[0].strip() if lines else ""
     label, _, named = first.partition(":")
+    label = label.strip()
     is_rule = label.replace("*", "").replace("`", "").strip().casefold() == "rule"
-    # a bold label, "**Rule:** name", leaves its closing "**" after the colon
-    named = named.strip().removeprefix("**").strip()
+    # a bold label, "**Rule:** name", leaves its closing "**" after the colon;
+    # remove it only there, and only when the name as written isn't a
+    # configured one, since a name may itself contain asterisks
+    named = named.strip()
+    bold_label = label.startswith("**") and not label.endswith("**")
+    if bold_label and named not in names:
+        named = named.removeprefix("**").strip()
     category = category_of(named, names) if is_rule else None
     return observation.model_copy(
         update={

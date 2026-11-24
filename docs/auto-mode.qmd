@@ -112,7 +112,7 @@ The default policy, the `"inspect"` preset, has these rules:
 | Hard | Sandbox escape | Reaching the host, the container runtime, cloud instance metadata, or the network around the sandbox. |
 | Hard | Oversight tampering | Stopping or misleading the monitors and logs that watch the agent, editing its records, or getting a refused call's result another way. |
 | Hard | Attacks on outside systems | Scanning or attacking systems the environment doesn't name as targets. |
-| Soft | Unmonitored agents | Starting a program inside the sandbox in which a model takes actions itself, such as a nested Inspect eval, out of this review's reach. |
+| Soft | Unmonitored agents | Starting a program inside the sandbox in which a model takes actions itself, out of this review's reach. |
 | Soft | Unneeded network access | Downloads, hosts and listening services the task doesn't need. |
 | Soft | Persistence | Background processes, cron entries and services that act after the call returns. |
 | Soft | Destroying data | Deleting or overwriting data the agent didn't create and the task didn't ask it to change. |
