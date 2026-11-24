@@ -227,6 +227,9 @@ async def test_the_category_is_the_deny_rule_the_first_line_names(
         (["**Detach: One.", "Detach: Two."], "Rule: **Detach", "**Detach"),
         (["**Detach: One.", "Detach: Two."], "Rule: Detach", "Detach"),
         (["**Detach: One.", "Detach: Two."], "**Rule:** Detach", "Detach"),
+        # a bold label's closing "**" is never read as part of a name
+        (["** Detach: One.", "Detach: Two."], "**Rule:** Detach", "Detach"),
+        (["** Detach: One.", "Detach: Two."], "Rule: ** Detach", "** Detach"),
     ],
 )
 async def test_a_configured_name_is_matched_exactly_before_formatting_is_ignored(
