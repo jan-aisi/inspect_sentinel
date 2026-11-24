@@ -17,7 +17,7 @@ from inspect_sentinel._step import AfterGenerate, BeforeGenerate, BeforeToolCall
 from inspect_sentinel._types import Protocol
 from inspect_sentinel.sidecar import Handler, Refuse, SidecarHost
 from inspect_sentinel.sidecar._host import ModelUsed, RunHost, noting_models
-from tests._fakes import ListRecorder
+from tests._fakes import FakeHost, ListRecorder
 from tests.sidecar._traffic import message, reply, request, weather
 
 
@@ -250,3 +250,34 @@ async def test_auto_mode_judges_with_the_role_the_sidecar_has(
     assert [used.role for used in noted.called] == ([judged_by] if judged_by else [])
     if judged_by is None:
         assert "no model to judge with" in str(failed.error)
+
+
+@pytest.mark.anyio
+async def test_auto_mode_in_a_run_with_no_eval_takes_the_users_messages_as_the_task() -> (
+    None
+):
+    judged = FakeHost(
+        outputs=[
+            ModelOutput.for_tool_call(
+                model="fake",
+                tool_name="answer",
+                tool_arguments={"explanation": "Rule: none\nRoutine.", "risk": 0.1},
+            )
+        ],
+        roles=["auto_mode"],
+    )
+    built = HostContext(
+        host=RunHost(judged, None), recorder=ListRecorder(), store=Store()
+    )
+    with running_step(built.recorder, built.store):
+        enter_layer("", "")
+        observations = await run_monitors(
+            {"auto_mode": auto_mode()}, built.context, _CALL
+        )
+
+    [reported] = observations
+    assert reported.report.suspicion == {"risk": 0.1}
+    prompt = judged.inputs[0][0].text
+    assert "There is no TASK block" in prompt
+    assert "TASK block is the only" not in prompt
+    assert "[BEGIN TASK" not in prompt

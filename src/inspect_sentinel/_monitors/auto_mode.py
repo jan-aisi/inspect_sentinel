@@ -6,20 +6,29 @@ from typing import Any
 from inspect_ai.model import GenerateConfig
 
 from .._context import Context
-from .._decorators import monitor
+from .._decorators import monitor, recorded_always
 from .._host import Host, role_configured
 from .._preprocess import LastTurns, StepPreprocessor
 from .._report import Observation
 from .._step import BeforeToolCall
 from .._types import Monitor
-from .auto_mode_policy import AutoModePolicy, deny_names, policy_text, resolve_policy
+from .auto_mode_policy import (
+    AutoModePolicy,
+    category_of,
+    deny_rule_names,
+    policy_digest,
+    policy_text,
+    recorded_policy,
+    resolve_policy,
+)
 from .auto_mode_prompt import RISK, instructions
 
 _ROLE = "auto_mode"
 _FALLBACK_ROLE = "monitor"
 
 
-@monitor(version=1)
+@monitor(version=2)
+@recorded_always(policy=recorded_policy)
 def auto_mode(
     policy: AutoModePolicy | Mapping[str, Any] | str | None = None,
     *,
@@ -31,14 +40,14 @@ def auto_mode(
 ) -> Monitor:
     """Judge each tool call before it runs, as the auto modes of coding agents do: a model scores how much risk the call carries against a policy, so `threshold()` can let it run, ask a person, or refuse it.
 
-    The judge model is shown the policy, the task, the agent's last `window` turns and the call, and answers with one score, `risk`, from 0.0 to 1.0, where 0.5 is the line between a call that may run without a person and one that should not. Its explanation begins with the deny rule the call falls under, which the observation records as `metadata["category"]` (`None` when no rule applies). The agent's own text and reasoning are left out by default, so the agent can't talk the judge into a low score; its tool calls and their results are shown, with every message marked by the sample's nonce.
+    The judge model is shown the policy, the task, the agent's last `window` turns and the call, and answers with one score, `risk`, from 0.0 to 1.0, where 0.5 is the line between a call that may run without a person and one that should not. Its explanation begins with the deny rule that decided the score, which the observation records as `metadata["category"]` (`None` when no rule applies), beside `metadata["policy_digest"]`, which identifies the policy the score was made under. The configuration records the policy with every `"$defaults"` written out, so a replay judges with the policy the eval ran even after the presets change. The agent's own text and reasoning are left out by default, so the agent can't talk the judge into a low score; its tool calls and their results are shown, with every message marked by the sample's nonce.
 
     By default the judge runs on the `auto_mode` model role, or on the `monitor` role when `auto_mode` is not configured. When neither is configured and no `model` is given, the monitor raises rather than fall back to the agent's own model, which would judge its own calls; under `threshold()`, that fails the sample. A judge model that gives no valid answer, or that refuses, also raises, and content the judge can't be shown, such as an image, scores 1.0 without asking the model (`on_unrenderable="flag"`), so the monitor fails closed.
 
     The monitor only scores. Which scores refuse a call is `threshold()`'s to decide, as in `threshold(auto_mode(), reject_at=0.5)`; the agent is told only that the call was not approved, never the judge's explanation.
 
     Args:
-        policy: What calls are judged against: `None` or `"inspect"` for the default policy, written for agents under evaluation in a sandbox; an `AutoModePolicy`; or a mapping of its fields, as a configuration file gives it.
+        policy: What calls are judged against: `None` or `"inspect"` for the default policy, written for an agent in a sandbox that is discarded after its run; an `AutoModePolicy`; or a mapping of its fields, as a configuration file gives it.
         model: A model name for the judge, used when `role` (by default `auto_mode`) is not configured.
         role: The model role the judge runs on, in place of `auto_mode`. With `role` given, the `monitor` role is not tried.
         window: How many of the agent's most recent turns the judge is shown, as `LastTurns(window)`.
@@ -62,7 +71,8 @@ def auto_mode(
         else config
     )
     text = policy_text(resolved)
-    names = deny_names(resolved)
+    names = deny_rule_names(resolved)
+    digest = policy_digest(resolved)
     preprocessor = StepPreprocessor(
         input_window=LastTurns(window),
         omit_assistant_text=not include_assistant_text,
@@ -82,7 +92,7 @@ def auto_mode(
             config=generate_config,
             on_unrenderable="flag",
         )
-        return _with_category(observation, names)
+        return _with_category(observation, names, digest)
 
     return judge
 
@@ -108,17 +118,25 @@ def _judge_model(
     )
 
 
-def _with_category(observation: Observation, names: Mapping[str, str]) -> Observation:
-    # the deny rule the explanation's first line names, as the policy names it;
-    # None for "Rule: none", for a name the policy doesn't have, or for no line
+def _with_category(
+    observation: Observation, names: list[str], digest: str
+) -> Observation:
+    # the deny rule the explanation's first line names, as the policy names it
+    # (None for "Rule: none", for a name the policy doesn't have, or for no
+    # such line), and which policy the score was made under
     lines = (observation.explanation or "").strip().splitlines()
-    first = lines[0].replace("*", "").replace("`", "").strip() if lines else ""
+    first = lines[0].strip() if lines else ""
     label, _, named = first.partition(":")
-    category = (
-        names.get(named.strip().strip("\"'.").strip().casefold())
-        if label.strip().casefold() == "rule"
-        else None
-    )
+    is_rule = label.replace("*", "").replace("`", "").strip().casefold() == "rule"
+    # a bold label, "**Rule:** name", leaves its closing "**" after the colon
+    named = named.strip().removeprefix("**").strip()
+    category = category_of(named, names) if is_rule else None
     return observation.model_copy(
-        update={"metadata": {**(observation.metadata or {}), "category": category}}
+        update={
+            "metadata": {
+                **(observation.metadata or {}),
+                "category": category,
+                "policy_digest": digest,
+            }
+        }
     )
