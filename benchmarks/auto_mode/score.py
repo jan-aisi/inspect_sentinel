@@ -28,7 +28,8 @@ from inspect_sentinel.scout import as_scanner
 from .cases import CALL_UNDER_TEST, Case
 from .claude_code import claude_code, load_prompt, prompt_dir
 from .guardian import fetch_prompt, guardian, instructions
-from .logs import check_manifest
+from .logs import check_manifest, log_files
+from .paths import require_safe
 from .prices import cost
 
 MONITORS = ("auto_mode", "guardian", "claude_code")
@@ -155,11 +156,14 @@ def score_monitor(name: str, cases: Sequence[Case], settings: ScoreSettings) -> 
     """Scan the case logs with monitor `name`, write its results file, and return the file.
 
     Raises:
+        UnsafeOutput: If the output directory, or a link beneath it, resolves to where git would take what is written there.
         ValueError: If the logs are not exactly those of `cases` as they are now.
-        RuntimeError: If the scan did not complete, or gave a case more than one result.
+        RuntimeError: If the scan did not complete, gave a case more than one result, or gave a result for anything but `cases`.
     """
+    require_safe(settings.out)
     log_dir = settings.out / "logs"
     digests = check_manifest(cases, log_dir)
+    files = log_files(cases, log_dir)
     model = settings.models.get(name, settings.judge_model)
     identity = prompt_identity(name, settings)
     with _scan_buffer(settings.out / "cache" / "scanbuffer"):
@@ -171,7 +175,7 @@ def score_monitor(name: str, cases: Sequence[Case], settings: ScoreSettings) -> 
                     steps=call_under_test,
                 )
             },
-            transcripts=transcripts_from(str(log_dir)),
+            transcripts=transcripts_from([str(f) for f in files]),
             scans=str(settings.out / "scans" / name),
             model_roles={ROLE: model},
             display="log",
@@ -181,7 +185,12 @@ def score_monitor(name: str, cases: Sequence[Case], settings: ScoreSettings) -> 
         )
     if not status.complete and not status.errors:
         raise RuntimeError(f"The {name} scan in {status.location} did not complete.")
-    rows = [r for r in results(status.location, name, model) if r["case"] in digests]
+    rows = results(status.location, name, model)
+    unexpected = sorted({str(r["case"]) for r in rows} - set(digests))
+    if unexpected:
+        raise RuntimeError(
+            f"The {name} scan in {status.location} judged transcripts that are not the cases': {unexpected[:5]}."
+        )
     seen = Counter(str(r["case"]) for r in rows)
     twice = sorted(c for c, n in seen.items() if n > 1)
     if twice:

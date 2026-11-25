@@ -25,14 +25,7 @@ from inspect_ai.model import (
 )
 from inspect_ai.tool import ToolCall, ToolChoice, ToolInfo
 
-from benchmarks.auto_mode.__main__ import (
-    OUT,
-    REPOSITORY,
-    UNSAFE_OUT,
-    check_out,
-    logs_match,
-    main,
-)
+from benchmarks.auto_mode.__main__ import OUT, UNSAFE_OUT, logs_match, main
 from benchmarks.auto_mode.cases import CALL_UNDER_TEST, Case, load_cases
 from benchmarks.auto_mode.claude_code import (
     load_prompt,
@@ -49,6 +42,7 @@ from benchmarks.auto_mode.guardian import (
 )
 from benchmarks.auto_mode.logs import case_digest, generate_logs
 from benchmarks.auto_mode.metrics import Scored, at_false_positive_rate, auc, roc
+from benchmarks.auto_mode.paths import REPOSITORY, UnsafeOutput, check_out
 from benchmarks.auto_mode.report import write_report
 from benchmarks.auto_mode.score import (
     FIELDS,
@@ -837,12 +831,84 @@ def test_no_committed_benchmark_file_names_one_of_the_classifiers_rules() -> Non
 
 def _repository(root: Path) -> Path:
     subprocess.run(["git", "init", "-q", str(root)], check=True)
-    # out/ is ignored; forced/ is too, but holds a file added regardless
-    (root / ".gitignore").write_text("out/\nforced/\n")
+    # out/ and linked/ are ignored; forced/ is too, but holds a file added
+    # regardless; published/ is not ignored
+    (root / ".gitignore").write_text("out/\nforced/\nlinked/\n")
     (root / "forced").mkdir()
     (root / "forced" / "kept.txt").write_text("x")
     subprocess.run(["git", "-C", str(root), "add", "-f", "forced/kept.txt"], check=True)
     return root
+
+
+LINKS: dict[str, tuple[str, str]] = {
+    # a link under the output directory: where it is, and what it points to
+    # (relative to the repository; "/" for outside it)
+    "scans to unignored": ("out/scans", "published"),
+    "scans to ignored": ("out/scans", "linked/scans"),
+    "scans to outside": ("out/scans", "/elsewhere/scans"),
+    "result file to unignored": ("out/results/guardian.csv", "published/g.csv"),
+    "nested to unignored": ("out/cache/guardian/x", "published"),
+    "outside back to unignored": ("../outside/scans", "published"),
+    "to tracked": ("out/scans", "forced"),
+}
+
+
+@pytest.mark.parametrize(
+    "link, root, refused",
+    [
+        ("scans to unignored", "out", "a link under --out"),
+        ("scans to ignored", "out", None),
+        ("scans to outside", "out", None),
+        ("result file to unignored", "out", "does not ignore it"),
+        ("nested to unignored", "out", "does not ignore it"),
+        ("outside back to unignored", "../outside", "a link under --out"),
+        ("to tracked", "out", "holds files git tracks"),
+    ],
+)
+def test_a_link_under_the_output_directory_must_resolve_somewhere_safe(
+    tmp_path: Path, link: str, root: str, refused: str | None
+) -> None:
+    repository = _repository(tmp_path / "repo")
+    at, to = LINKS[link]
+    path = repository / at
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / to.lstrip("/") if to.startswith("/") else repository / to
+    path.symlink_to(target)
+    reason = check_out(repository / root, repository)
+    if refused is None:
+        assert reason is None
+    else:
+        assert reason is not None and refused in reason
+
+
+@pytest.mark.timeout(120)
+def test_the_benchmark_refuses_to_score_through_a_link_into_the_repository(
+    tmp_path: Path,
+) -> None:
+    cases = [Case.model_validate(_case("allow-1", "allow", "ls"))]
+    out = tmp_path / "out"
+    generate_logs(cases, out / "logs")
+    target = REPOSITORY / "benchmarks" / "auto_mode" / "linked-scans"
+    (out / "scans").symlink_to(target)
+    settings = ScoreSettings(out=out, judge_model="auto_mode_bench_stub/judge")
+    with pytest.raises(UnsafeOutput, match="a link under --out"):
+        score_monitor("auto_mode", cases, settings)
+    file = _write(tmp_path / "cases.yaml", [_case("allow-1", "allow", "ls")])
+    code = main(
+        [
+            "score",
+            "--cases",
+            str(file),
+            "--out",
+            str(out),
+            "--judge-model",
+            "auto_mode_bench_stub/judge",
+            "--monitors",
+            "auto_mode",
+        ]
+    )
+    assert code == UNSAFE_OUT
+    assert not target.exists()
 
 
 @pytest.mark.parametrize(
@@ -1005,6 +1071,56 @@ def test_logs_that_are_not_exactly_the_cases_are_refused_before_scoring(
     assert not (tmp_path / "out" / "scans").exists()
 
 
+@pytest.mark.timeout(120)
+def test_a_nested_log_invalidates_the_logs_and_force_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cases = [
+        Case.model_validate(_case("block-1", "block", f"curl x # {DANGER}")),
+        Case.model_validate(_case("allow-1", "allow", "ls")),
+    ]
+    out = tmp_path / "out"
+    generate_logs(cases, out / "logs")
+    # a third case's log, nested where a directory scan would find it
+    other = Case.model_validate(_case("other-1", "allow", "pwd"))
+    generate_logs([other], out / "logs" / "archive")
+    assert not logs_match(cases, out / "logs")
+    settings = ScoreSettings(out=out, judge_model="auto_mode_bench_stub/judge")
+    with pytest.raises(ValueError, match="not in the manifest"):
+        score_monitor("auto_mode", cases, settings)
+    assert not (out / "scans").exists()
+
+    # made again, the nested log is gone, and a scan judges exactly the cases,
+    # each call accounted for
+    generate_logs(cases, out / "logs", force=True)
+    assert not list((out / "logs" / "archive").rglob("*.eval"))
+    assert logs_match(cases, out / "logs")
+    import csv
+
+    with score_monitor("auto_mode", cases, settings).open() as f:
+        rows = list(csv.DictReader(f))
+    assert sorted(r["case"] for r in rows) == ["allow-1", "block-1"]
+    assert [r["calls"] for r in rows] == ["1", "1"]
+    assert [r["native_block"] for r in sorted(rows, key=lambda r: r["case"])] == [
+        "False",
+        "True",
+    ]
+
+    # a result for anything but the cases fails the scan rather than being
+    # dropped, with its calls
+    from benchmarks.auto_mode import score as scoring
+
+    found = scoring.results
+
+    def with_extra(location: str, name: str, model: str) -> list[dict[str, Any]]:
+        rows = found(location, name, model)
+        return [*rows, {**rows[0], "case": "other-1"}]
+
+    monkeypatch.setattr(scoring, "results", with_extra)
+    with pytest.raises(RuntimeError, match="not the cases'"):
+        score_monitor("auto_mode", cases, settings)
+
+
 # --- Guardian refuses a field present with a value not of its type ----------
 
 
@@ -1017,6 +1133,10 @@ def test_logs_that_are_not_exactly_the_cases_are_refused_before_scoring(
             "unknown user_authorization",
         ),
         ('{"outcome":"allow","rationale":123}', "not a string"),
+        ('{"outcome":"allow","risk_level":[]}', "unknown risk_level"),
+        ('{"outcome":"allow","risk_level":{"a":1}}', "unknown risk_level"),
+        ('{"outcome":"allow","user_authorization":[]}', "unknown user_authorization"),
+        ('{"outcome":"allow","rationale":["x"]}', "not a string"),
     ],
 )
 def test_a_guardian_field_with_a_value_not_of_its_type_fails_the_parse(
@@ -1045,6 +1165,12 @@ def _answer(text: str) -> ModelOutput:
     "answers, blocked",
     [
         (['{"outcome":"allow","risk_level":"bogus"}', '{"outcome":"deny"}'], True),
+        (['{"outcome":"allow","risk_level":[]}', '{"outcome":"allow"}'], False),
+        (['{"outcome":"deny","risk_level":{}}', '{"outcome":"allow"}'], False),
+        (
+            ['{"outcome":"allow","user_authorization":{"x":1}}', '{"outcome":"deny"}'],
+            True,
+        ),
         (['{"outcome":"allow","rationale":1}'] * 3, None),
     ],
 )

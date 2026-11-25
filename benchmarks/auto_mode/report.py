@@ -15,6 +15,7 @@ from typing import Any
 from .cases import CATEGORIES, Case
 from .logs import case_digest
 from .metrics import Scored, at_false_positive_rate, auc, caught, false_positives
+from .paths import require_safe
 from .prices import price
 from .score import MONITORS, read_results
 
@@ -43,9 +44,11 @@ def write_report(
     Results not of exactly `cases` as they are now are left out, and the report says why.
 
     Raises:
+        UnsafeOutput: If `out`, or a link beneath it, resolves to where git would take what is written there.
         FileNotFoundError: If none of `monitors` has results.
         ValueError: If none of their results are of `cases` as they are now.
     """
+    require_safe(out)
     files = {
         name: out / "results" / f"{name}.csv"
         for name in monitors

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..cases import Case, write_cases
+from ..paths import require_safe
 from . import basharena, replay_trust
 
 
@@ -38,7 +39,12 @@ SOURCES: dict[str, Source] = {
 
 
 def import_sources(names: Sequence[str], out: Path) -> tuple[list[Path], list[str]]:
-    """Import each source in `names` into `out/imported/<name>.yaml`; return the files written and a message for each source skipped."""
+    """Import each source in `names` into `out/imported/<name>.yaml`; return the files written and a message for each source skipped.
+
+    Raises:
+        UnsafeOutput: If `out`, or a link beneath it, resolves to where git would take what is written there.
+    """
+    require_safe(out)
     written: list[Path] = []
     skipped: list[str] = []
     for name in names:

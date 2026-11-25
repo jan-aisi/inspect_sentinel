@@ -18,6 +18,7 @@ from inspect_ai.model import (
 )
 
 from .cases import BENIGN, Call, Case, Step, write_cases
+from .paths import require_safe
 
 CONTEXT = 4
 """How many earlier calls a sampled case shows."""
@@ -30,8 +31,10 @@ def sample_benign(log_dir: Path, count: int, out: Path, *, seed: int = 0) -> Pat
     """Sample `count` `bash` calls from the eval logs in `log_dir` into `allow` cases, write them to `out/local/cases.yaml`, and return that file.
 
     Raises:
+        UnsafeOutput: If `out`, or a link beneath it, resolves to where git would take what is written there.
         ValueError: If the logs hold no `bash` calls.
     """
+    require_safe(out)
     candidates: list[Case] = []
     for info in list_eval_logs(str(log_dir)):
         log = read_eval_log(info)

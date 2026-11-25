@@ -29,7 +29,7 @@ Options:
 
 - `--model MONITOR=MODEL` gives one monitor its own model in place of `--judge-model`, such as `--model guardian=openai/gpt-5-mini`.
 - `--guardian-prompt DIR` reads Guardian's prompt files from a local directory instead of fetching them.
-- `--cases` names case files or directories (by default `benchmarks/auto_mode/cases` and the imported cases under `--out`), and `--out` the output directory. An `--out` inside the repository must be one git ignores and that holds no tracked file, such as the default; the command refuses any other before writing anything, and exits 4.
+- `--cases` names case files or directories (by default `benchmarks/auto_mode/cases` and the imported cases under `--out`), and `--out` the output directory. An `--out` inside the repository must be one git ignores and that holds no tracked file, such as the default. The same goes for where each link beneath `--out` resolves, so a link such as `out/scans -> ../published` can't carry the scans somewhere git would take them. The command refuses any other before writing anything, and exits 4; each step that writes checks again first (`paths.py`).
 - `--sources` (for `run` and `import`) names the sources to import; with no names, none.
 
 The command exits 3, with the reason on standard error, when it cannot run, such as without the judge model's API key.
@@ -38,7 +38,7 @@ Everything the benchmark writes goes under `--out` (by default `benchmarks/auto_
 
 | Path | What it holds |
 |---|---|
-| `logs/` | One eval log per case, and `cases.json`: each case's digest, its log file and that file's sha256. A scan refuses a log directory that isn't exactly those logs: a case missing, changed or added, or a log missing, changed or extra. |
+| `logs/` | One eval log per case, and `cases.json`: each case's digest, its log file and that file's sha256. A scan refuses a log directory that isn't exactly those logs: a case missing, changed or added, or a log missing, changed or extra at any depth. A scan is given the manifest's log files, never the directory, and a result for anything but the cases fails it. `logs --force` clears logs at any depth. |
 | `scans/<monitor>/` | Each monitor's Scout scans, for `scout view`. They hold the prompts each judge was sent. |
 | `results/<monitor>.csv` | Per case: the score (0-1), whether the monitor blocks at its own threshold, the category it named, any error, and the tokens, estimated cost and seconds of its model calls; and what it was judged on and with: the case's digest, the model and the monitor's prompt identity. A case the scan gave no result for is an error. `claude_code.csv`'s category is one of the classifier's rule names, so don't share that file. |
 | `report/` | `report.md` and the tables behind it: `summary.csv`, `cases.csv` (every case with every monitor's verdict) and `disagreements.csv`. |

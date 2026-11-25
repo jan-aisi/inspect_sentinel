@@ -25,6 +25,7 @@ from inspect_ai.solver import Generate, Solver, TaskState, solver, use_tools
 from inspect_ai.tool import Tool, ToolCall, tool
 
 from .cases import CALL_UNDER_TEST, Call, Case
+from .paths import require_safe
 
 MANIFEST = "cases.json"
 """The file in the log directory recording, for each case, its digest, its log file and that file's sha256, so a scan can check the logs are exactly the cases' as they are now."""
@@ -151,16 +152,18 @@ def generate_logs(
     """Write a log for each case under `log_dir`, with the manifest naming each case's digest and log, and return `log_dir`.
 
     Raises:
+        UnsafeOutput: If `log_dir`, or a link beneath it, resolves to where git would take what is written there.
         FileExistsError: If `log_dir` already holds logs and `force` is not set; logs are made once and reused.
         RuntimeError: If a case's log did not succeed.
     """
+    require_safe(log_dir)
     if (log_dir / MANIFEST).exists() and not force:
         raise FileExistsError(
             f"{log_dir} already holds logs; they are made once and reused. Pass --force to make them again."
         )
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / MANIFEST).unlink(missing_ok=True)
-    for old in log_dir.glob("*.eval"):
+    for old in _logs_in(log_dir):
         old.unlink()
     logs = eval(
         [case_task(case) for case in cases],
@@ -192,7 +195,7 @@ def generate_logs(
 
 
 def check_manifest(cases: Sequence[Case], log_dir: Path) -> dict[str, str]:
-    """Check that `log_dir` holds exactly one log for each of `cases`, made from it as it is now and unchanged since, and no other log; return each case's digest by id.
+    """Check that `log_dir` holds exactly one log for each of `cases`, made from it as it is now and unchanged since, and no other log at any depth; return each case's digest by id.
 
     Raises:
         FileNotFoundError: If `log_dir` has no manifest.
@@ -213,7 +216,7 @@ def check_manifest(cases: Sequence[Case], log_dir: Path) -> dict[str, str]:
         if c.id in entries and entries[c.id]["digest"] != case_digest(c)
     )
     named = {e["log"] for e in entries.values()}
-    present = {f.name for f in log_dir.glob("*.eval")}
+    present = {f.relative_to(log_dir).as_posix() for f in _logs_in(log_dir)}
     gone = sorted(i for i, e in entries.items() if e["log"] not in present)
     altered = sorted(
         i
@@ -226,6 +229,29 @@ def check_manifest(cases: Sequence[Case], log_dir: Path) -> dict[str, str]:
             f"The logs in {log_dir} don't match the cases (cases with no log: {missing[:5]}; logs of other cases: {extra[:5]}; cases changed: {changed[:5]}; log files missing: {gone[:5]}; log files changed: {altered[:5]}; log files not in the manifest: {unnamed[:5]}); make them again with `logs --force`."
         )
     return {i: e["digest"] for i, e in entries.items()}
+
+
+def log_files(cases: Sequence[Case], log_dir: Path) -> list[Path]:
+    """The log of each of `cases` in `log_dir`, in their order, once `check_manifest()` finds the directory is exactly theirs; a scan is given these files, never the directory.
+
+    Raises:
+        FileNotFoundError: If `log_dir` has no manifest.
+        ValueError: If the logs in `log_dir` are not exactly those of `cases` as they are now.
+    """
+    check_manifest(cases, log_dir)
+    manifest: dict[str, Any] = json.loads((log_dir / MANIFEST).read_text())
+    return [log_dir / manifest["cases"][c.id]["log"] for c in cases]
+
+
+def _logs_in(log_dir: Path) -> list[Path]:
+    # every eval log under log_dir at any depth, in either of Inspect's
+    # formats, the manifest aside
+    return sorted(
+        f
+        for pattern in ("*.eval", "*.json")
+        for f in log_dir.rglob(pattern)
+        if f != log_dir / MANIFEST
+    )
 
 
 def _sha256(file: Path) -> str:

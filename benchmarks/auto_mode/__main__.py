@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from inspect_ai._util.error import PrerequisiteError
 from .cases import Case, load_cases
 from .local import sample_benign
 from .logs import check_manifest, generate_logs
+from .paths import UnsafeOutput, check_out
 from .report import write_report
 from .score import MONITORS, ScoreSettings, runnable, score_monitor
 from .sources import SOURCES, import_sources
@@ -19,13 +19,12 @@ from .sources import SOURCES, import_sources
 HERE = Path(__file__).parent
 CASES = HERE / "cases"
 OUT = HERE / "out"
-REPOSITORY = HERE.parent.parent
 
 NOT_RUN = 3
 """The exit status when the benchmark could not run, such as without the judge model's API key."""
 
 UNSAFE_OUT = 4
-"""The exit status when `--out` is inside the repository where git would take its contents: not ignored, or holding tracked files."""
+"""The exit status when `--out`, or a link beneath it, resolves inside the repository where git would take what is written there: not ignored, or holding tracked files."""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -170,6 +169,10 @@ def main(argv: list[str] | None = None) -> int:
     except PrerequisiteError as ex:
         print(ex.message, file=sys.stderr, flush=True)
         return NOT_RUN
+    except UnsafeOutput as ex:
+        # a link made under --out after the check above
+        print(ex, file=sys.stderr, flush=True)
+        return UNSAFE_OUT
     return 0
 
 
@@ -186,45 +189,6 @@ def logs_match(cases: list[Case], log_dir: Path) -> bool:
     except (FileNotFoundError, ValueError):
         return False
     return True
-
-
-def check_out(out: Path, repository: Path = REPOSITORY) -> str | None:
-    """Why `out` is not a safe output directory, or None where it is.
-
-    The output holds the judges' prompts and imported datasets, which must never be committed. So `out` may be anywhere outside `repository`, but inside it only where git ignores it and tracks nothing under it.
-    """
-    resolved = out.resolve()
-    root = repository.resolve()
-    if not resolved.is_relative_to(root):
-        return None
-    relative = resolved.relative_to(root).as_posix()
-    if relative == ".":
-        return f"--out {out} is the repository itself; choose a directory git ignores, such as benchmarks/auto_mode/out, or one outside the repository."
-    try:
-        ignored = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "check-ignore",
-                "-q",
-                "--no-index",
-                f"{relative}/",
-            ],
-            capture_output=True,
-        )
-        tracked = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--", relative],
-            capture_output=True,
-            text=True,
-        )
-    except OSError as ex:
-        return f"--out {out} is inside the repository, and git could not be run to check that it is ignored ({ex}); choose a directory outside the repository."
-    if tracked.returncode == 0 and tracked.stdout.strip():
-        return f"--out {out} holds files git tracks; choose a directory with none."
-    if ignored.returncode != 0 or tracked.returncode != 0:
-        return f"--out {out} is inside the repository but git does not ignore it (or could not tell), so its prompts and datasets could be committed; use benchmarks/auto_mode/out or a directory outside the repository."
-    return None
 
 
 def _pair(text: str) -> tuple[str, str]:
