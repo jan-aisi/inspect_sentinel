@@ -1,4 +1,4 @@
-"""Measuring a monitor against the labels: catch rate and false positives at its own threshold, ROC and AUC from its scores, and catch rate at matched false-positive rates.
+"""Measuring a monitor against the labels: catch rate and false positives at its own threshold, ROC and AUC from its scores, and catch rate within a false-positive-rate budget.
 
 A case the monitor failed on (an error in its scan) is counted as blocked, with score 1.0, as each of the three fails closed; the report counts errors separately.
 """
@@ -77,7 +77,7 @@ def auc(cases: Sequence[Scored]) -> float | None:
 
 @dataclass(frozen=True)
 class Operating:
-    """The catch rate at the lowest threshold whose false-positive rate is within a target."""
+    """The catch rate at the best threshold whose false-positive rate is within a budget, and the false-positive rate it attains, which can be lower: tied scores are never split at random."""
 
     target: float
     threshold: float | None

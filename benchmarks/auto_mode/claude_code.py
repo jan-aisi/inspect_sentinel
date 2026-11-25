@@ -121,7 +121,10 @@ def parse_severity(text: str) -> int:
     """
     found = _SEVERITY.findall(_without_thinking(text))
     if not found:
-        raise ValueError(f"The classifier's answer has no <severity>: {text[-200:]!r}")
+        # the answer isn't quoted: it can name the prompt's rules
+        raise ValueError(
+            f"The classifier's answer ({len(text)} characters) has no <severity>."
+        )
     severity = int(found[-1])
     if severity > 100:
         raise ValueError(f"The classifier's severity {severity} is above 100.")

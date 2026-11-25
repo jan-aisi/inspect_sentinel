@@ -11,6 +11,7 @@ import hashlib
 import json
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 from inspect_ai import Task, eval
 from inspect_ai.dataset import Sample
@@ -26,7 +27,10 @@ from inspect_ai.tool import Tool, ToolCall, tool
 from .cases import CALL_UNDER_TEST, Call, Case
 
 MANIFEST = "cases.json"
-"""The file in the log directory recording each case's digest, so a scan can check the logs match the cases."""
+"""The file in the log directory recording, for each case, its digest, its log file and that file's sha256, so a scan can check the logs are exactly the cases' as they are now."""
+
+MANIFEST_VERSION = 2
+"""The manifest's format; logs with an older one are made again."""
 
 
 def case_digest(case: Case) -> str:
@@ -144,7 +148,7 @@ def text_editor(results: Iterator[str]) -> Tool:
 def generate_logs(
     cases: Sequence[Case], log_dir: Path, *, max_tasks: int = 32, force: bool = False
 ) -> Path:
-    """Write a log for each case under `log_dir`, with the manifest naming each case's digest, and return `log_dir`.
+    """Write a log for each case under `log_dir`, with the manifest naming each case's digest and log, and return `log_dir`.
 
     Raises:
         FileExistsError: If `log_dir` already holds logs and `force` is not set; logs are made once and reused.
@@ -155,6 +159,7 @@ def generate_logs(
             f"{log_dir} already holds logs; they are made once and reused. Pass --force to make them again."
         )
     log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / MANIFEST).unlink(missing_ok=True)
     for old in log_dir.glob("*.eval"):
         old.unlink()
     logs = eval(
@@ -168,28 +173,67 @@ def generate_logs(
     failed = [log.location for log in logs if log.status != "success"]
     if failed:
         raise RuntimeError(f"{len(failed)} case logs did not succeed.")
+    files: dict[str, str] = {}
+    for log in logs:
+        [sample_id] = log.eval.dataset.sample_ids or [None]
+        files[str(sample_id)] = Path(log.location).name
+    entries = {
+        case.id: {
+            "digest": case_digest(case),
+            "log": files[case.id],
+            "sha256": _sha256(log_dir / files[case.id]),
+        }
+        for case in cases
+    }
     (log_dir / MANIFEST).write_text(
-        json.dumps({case.id: case_digest(case) for case in cases}, indent=1)
+        json.dumps({"version": MANIFEST_VERSION, "cases": entries}, indent=1)
     )
     return log_dir
 
 
-def check_manifest(cases: Sequence[Case], log_dir: Path) -> None:
-    """Check that `log_dir`'s logs were made from `cases` as they are now.
+def check_manifest(cases: Sequence[Case], log_dir: Path) -> dict[str, str]:
+    """Check that `log_dir` holds exactly one log for each of `cases`, made from it as it is now and unchanged since, and no other log; return each case's digest by id.
 
     Raises:
         FileNotFoundError: If `log_dir` has no manifest.
-        ValueError: If a case is missing from the logs or changed since they were made.
+        ValueError: If the manifest doesn't name exactly `cases` as they are now, or the logs in `log_dir` aren't exactly the ones it names.
     """
-    manifest: dict[str, str] = json.loads((log_dir / MANIFEST).read_text())
-    missing = [c.id for c in cases if c.id not in manifest]
-    changed = [
-        c.id for c in cases if c.id in manifest and manifest[c.id] != case_digest(c)
-    ]
-    if missing or changed:
+    manifest: dict[str, Any] = json.loads((log_dir / MANIFEST).read_text())
+    if manifest.get("version") != MANIFEST_VERSION:
         raise ValueError(
-            f"The logs in {log_dir} don't match the cases (missing: {missing[:5]}, changed: {changed[:5]}); make them again with `logs --force`."
+            f"The logs in {log_dir} were made by an older version of the benchmark; make them again with `logs --force`."
         )
+    entries: dict[str, dict[str, str]] = manifest["cases"]
+    ids = {c.id for c in cases}
+    missing = sorted(ids - set(entries))
+    extra = sorted(set(entries) - ids)
+    changed = sorted(
+        c.id
+        for c in cases
+        if c.id in entries and entries[c.id]["digest"] != case_digest(c)
+    )
+    named = {e["log"] for e in entries.values()}
+    present = {f.name for f in log_dir.glob("*.eval")}
+    gone = sorted(i for i, e in entries.items() if e["log"] not in present)
+    altered = sorted(
+        i
+        for i, e in entries.items()
+        if e["log"] in present and _sha256(log_dir / e["log"]) != e["sha256"]
+    )
+    unnamed = sorted(present - named)
+    if missing or extra or changed or gone or altered or unnamed:
+        raise ValueError(
+            f"The logs in {log_dir} don't match the cases (cases with no log: {missing[:5]}; logs of other cases: {extra[:5]}; cases changed: {changed[:5]}; log files missing: {gone[:5]}; log files changed: {altered[:5]}; log files not in the manifest: {unnamed[:5]}); make them again with `logs --force`."
+        )
+    return {i: e["digest"] for i, e in entries.items()}
+
+
+def _sha256(file: Path) -> str:
+    digest = hashlib.sha256()
+    with file.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _turn(call: Call, id: str) -> ModelOutput:
