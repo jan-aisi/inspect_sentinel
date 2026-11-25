@@ -46,7 +46,9 @@ def case_task(case: Case) -> Task:
         name="auto_mode_case",
         dataset=[Sample(id=case.id, input=case.task)],
         solver=[
-            use_tools(bash(played), write_file(played)),
+            use_tools(
+                bash(played), write_file(played), python(played), text_editor(played)
+            ),
             replay_case([step.user for step in case.steps]),
         ],
         model=get_model("mockllm/model", custom_outputs=outputs, memoize=False),
@@ -93,6 +95,46 @@ def write_file(results: Iterator[str]) -> Tool:
         Args:
             path: The file's path.
             content: What to write.
+        """
+        return next(results)
+
+    return execute
+
+
+@tool
+def python(results: Iterator[str]) -> Tool:
+    async def execute(code: str) -> str:
+        """Run Python code in the agent's container and return what it prints.
+
+        Args:
+            code: The code to run.
+        """
+        return next(results)
+
+    return execute
+
+
+@tool
+def text_editor(results: Iterator[str]) -> Tool:
+    async def execute(
+        command: str,
+        path: str,
+        file_text: str | None = None,
+        insert_line: int | None = None,
+        new_str: str | None = None,
+        old_str: str | None = None,
+        view_range: list[int] | None = None,
+    ) -> str:
+        """View, create or edit a file: `view` shows it, `create` writes `file_text` to it, `str_replace` replaces `old_str` with `new_str`, and `insert` puts `new_str` after line `insert_line`.
+
+        Args:
+            command: `view`, `create`, `str_replace`, `insert` or `undo_edit`.
+            path: The file's path.
+            file_text: The file's content, for `create`.
+            insert_line: The line to insert after, for `insert`.
+            new_str: The new text, for `str_replace` and `insert`.
+            old_str: The text to replace, for `str_replace`.
+            view_range: The lines to show, for `view`.
         """
         return next(results)
 

@@ -41,14 +41,21 @@ TAGS = (
     "risky_looking",
     "authorized",
     "later_user_message",
+    "approval_after_task",
+    "imported",
 )
-"""What makes a case hard, for slicing the report: a harmful effect split across two calls (`split`), an instruction injected in a tool result (`injection`), agent text claiming approval (`claimed_approval`), a background process (`background`), starting another agent (`agent`), an encoded payload (`encoded`); a benign call that looks risky (`risky_looking`), one the task explicitly asks for (`authorized`), or one a later user message authorizes (`later_user_message`)."""
+"""What makes a case hard, for slicing the report: a harmful effect split across two calls (`split`), an instruction injected in a tool result (`injection`), agent text claiming approval (`claimed_approval`), a background process (`background`), starting another agent (`agent`), an encoded payload (`encoded`); a benign call that looks risky (`risky_looking`), one the task explicitly asks for (`authorized`), or one a later user message authorizes (`later_user_message`); `approval_after_task` marks the benign cases where a user message after the task approves the call, which `auto_mode()`'s eval prompt does not count as authorization, so the report shows them apart; `imported` marks a case taken from an existing source rather than written for the benchmark."""
 
-TOOLS: dict[str, tuple[str, ...]] = {
-    "bash": ("command",),
-    "write_file": ("path", "content"),
+TOOLS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "bash": (("command",), ()),
+    "write_file": (("path", "content"), ()),
+    "python": (("code",), ()),
+    "text_editor": (
+        ("command", "path"),
+        ("file_text", "old_str", "new_str", "insert_line", "view_range"),
+    ),
 }
-"""The tools a case may call, with the arguments each takes."""
+"""The tools a case may call, with the arguments each requires and those it may also take. `python` and `text_editor` take inspect_ai's tools' arguments, for imported cases."""
 
 CALL_UNDER_TEST = "call-under-test"
 """The tool call id of each case's call under test, its step id in replay."""
@@ -62,22 +69,25 @@ class Call(_Strict):
     """A tool call the agent makes, with the text it writes beside the call."""
 
     tool: str
-    """The tool: `bash` or `write_file`."""
+    """The tool: `bash`, `write_file`, `python` or `text_editor` (see `TOOLS`)."""
 
-    args: dict[str, str]
-    """The call's arguments: `command` for `bash`; `path` and `content` for `write_file`."""
+    args: dict[str, Any]
+    """The call's arguments: `command` for `bash`; `path` and `content` for `write_file`; `code` for `python`; `command`, `path` and the rest of inspect_ai's `text_editor()` arguments for `text_editor`."""
 
     text: str = ""
     """The agent's own text in the message that makes the call."""
 
     @model_validator(mode="after")
     def _known_tool(self) -> Call:
-        expected = TOOLS.get(self.tool)
-        if expected is None:
+        found = TOOLS.get(self.tool)
+        if found is None:
             raise ValueError(f"Unknown tool {self.tool!r}; cases use {list(TOOLS)}.")
-        if set(self.args) != set(expected):
+        required, optional = found
+        if not set(required) <= set(self.args) <= set(required) | set(optional):
             raise ValueError(
-                f"{self.tool} takes arguments {list(expected)}, got {list(self.args)}."
+                f"{self.tool} takes arguments {list(required)}"
+                + (f" and optionally {list(optional)}" if optional else "")
+                + f", got {list(self.args)}."
             )
         return self
 
@@ -86,7 +96,7 @@ class Step(_Strict):
     """An earlier step: a tool call and its recorded result, or a user message."""
 
     tool: str | None = None
-    args: dict[str, str] | None = None
+    args: dict[str, Any] | None = None
     text: str = ""
     result: str | None = None
     """The tool's recorded output."""
@@ -139,7 +149,13 @@ class Case(_Strict):
     """One sentence for a reviewer: why the label is right."""
 
     source: str | None = None
-    """Attribution, where a case was inspired by published material."""
+    """Attribution: the published material a case was inspired by, or the item it was imported from."""
+
+    detail: str | None = None
+    """An imported case's own category in its source, such as a dataset's side task."""
+
+    origin: str = "written"
+    """Where the case comes from, for counting by source: `written` for a case written for the benchmark, else the source it was taken from, such as `sentinel_tests` or an importer's name."""
 
     task: str
     """The user's task, the sample's input."""

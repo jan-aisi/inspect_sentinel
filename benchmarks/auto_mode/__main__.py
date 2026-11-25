@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from inspect_ai._util.error import PrerequisiteError
 
-from .cases import load_cases
+from .cases import Case, load_cases
 from .local import sample_benign
-from .logs import MANIFEST, generate_logs
+from .logs import MANIFEST, check_manifest, generate_logs
 from .report import write_report
 from .score import MONITORS, ScoreSettings, runnable, score_monitor
+from .sources import SOURCES, import_sources
 
 HERE = Path(__file__).parent
 CASES = HERE / "cases"
@@ -34,8 +36,8 @@ def main(argv: list[str] | None = None) -> int:
             "--cases",
             type=Path,
             nargs="+",
-            default=[CASES],
-            help="Case files or directories.",
+            default=None,
+            help="Case files or directories; by default the committed cases and the imported ones under --out.",
         )
         p.add_argument(
             "--out",
@@ -98,23 +100,45 @@ def main(argv: list[str] | None = None) -> int:
     report = commands.add_parser("report", help="Write the report from the results.")
     common(report)
 
+    imports = commands.add_parser(
+        "import",
+        help="Import cases from existing sources into --out/imported (never committed).",
+    )
+    imports.add_argument("--out", type=Path, default=OUT)
+    imports.add_argument(
+        "--sources", nargs="*", choices=list(SOURCES), default=list(SOURCES)
+    )
+
     run = commands.add_parser(
-        "run", help="Make the logs if there are none, score, and report."
+        "run",
+        help="Import the sources, make the logs if they don't match the cases, score, and report.",
     )
     common(run)
     scoring(run)
+    run.add_argument(
+        "--sources", nargs="*", choices=list(SOURCES), default=list(SOURCES)
+    )
 
     args = parser.parse_args(argv)
     out: Path = args.out
     if args.command == "sample-benign":
         print(sample_benign(args.logs, args.count, out, seed=args.seed))
         return 0
-    cases = load_cases(args.cases)
+    if args.command in ("import", "run"):
+        written, skipped = import_sources(args.sources, out)
+        for message in skipped:
+            print(message, file=sys.stderr)
+        for file in written:
+            print(f"Imported {file}")
+        if args.command == "import":
+            return 0
+    cases = load_cases(args.cases or default_cases(out))
     try:
-        if args.command == "logs" or (
-            args.command == "run" and not (out / "logs" / MANIFEST).exists()
-        ):
-            generate_logs(cases, out / "logs", force=getattr(args, "force", False))
+        if args.command == "logs":
+            generate_logs(cases, out / "logs", force=args.force)
+            print(f"Made {len(cases)} case logs in {out / 'logs'}.")
+        elif args.command == "run" and not logs_match(cases, out / "logs"):
+            generate_logs(cases, out / "logs", force=True)
             print(f"Made {len(cases)} case logs in {out / 'logs'}.")
         if args.command in ("score", "run"):
             settings = ScoreSettings(
@@ -137,6 +161,24 @@ def main(argv: list[str] | None = None) -> int:
         print(ex.message, file=sys.stderr, flush=True)
         return NOT_RUN
     return 0
+
+
+def default_cases(out: Path) -> list[Path]:
+    """The committed cases, and the imported ones under `out` where there are any."""
+    imported = out / "imported"
+    return [CASES, imported] if imported.is_dir() else [CASES]
+
+
+def logs_match(cases: list[Case], log_dir: Path) -> bool:
+    """Whether `log_dir` holds logs made from exactly `cases` as they are now."""
+    if not (log_dir / MANIFEST).exists():
+        return False
+    try:
+        check_manifest(cases, log_dir)
+    except ValueError:
+        return False
+    manifest: dict[str, str] = json.loads((log_dir / MANIFEST).read_text())
+    return set(manifest) == {c.id for c in cases}
 
 
 def _pair(text: str) -> tuple[str, str]:

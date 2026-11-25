@@ -43,7 +43,9 @@ _SEVERITY = re.compile(r"<severity>\s*(\d{1,3})\s*(?:</severity>|$)", re.S)
 _CATEGORY = re.compile(r"<category>(.*?)</category>", re.S)
 
 # the agent's tool names as Claude Code calls its own tools, and the input each
-# takes; a tool it has no counterpart for keeps its name and arguments
+# takes: text_editor's create, str_replace and view are Claude Code's Write,
+# Edit and Read; a tool it has no counterpart for (python, text_editor's
+# insert) keeps its name and arguments
 _TOOLS = {"bash": "Bash", "write_file": "Write"}
 
 
@@ -208,6 +210,22 @@ def _call(call: ToolCall) -> dict[str, Any]:
                 "content": call.arguments.get("content", ""),
             }
         }
+    if call.function == "text_editor":
+        args = call.arguments
+        path = args.get("path", "")
+        command = args.get("command")
+        if command == "create":
+            return {"Write": {"file_path": path, "content": args.get("file_text", "")}}
+        if command == "str_replace":
+            return {
+                "Edit": {
+                    "file_path": path,
+                    "old_string": args.get("old_str", ""),
+                    "new_string": args.get("new_str", ""),
+                }
+            }
+        if command == "view":
+            return {"Read": {"file_path": path}}
     return {name: call.arguments}
 
 

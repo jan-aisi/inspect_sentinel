@@ -14,6 +14,9 @@ from .metrics import Scored, at_false_positive_rate, auc, caught, false_positive
 from .prices import price
 from .score import MONITORS, read_results
 
+APART = "approval_after_task"
+"""A tag whose benign cases the summary also leaves out of the false-positive rate, so they show apart."""
+
 TARGETS = (0.01, 0.05)
 """The false-positive rates the monitors' catch rates are compared at."""
 
@@ -45,7 +48,8 @@ def write_report(cases: Sequence[Case], out: Path) -> Path:
     }
     directory = out / "report"
     directory.mkdir(parents=True, exist_ok=True)
-    summary = [_summary(name, scored[name], found[name]) for name in found]
+    apart = {c.id for c in cases if APART in c.tags}
+    summary = [_summary(name, scored[name], found[name], apart) for name in found]
     _write_csv(directory / "summary.csv", summary)
     _write_csv(directory / "cases.csv", _per_case(cases, found))
     disagreements = _disagreements(cases, found)
@@ -64,10 +68,14 @@ def _scored(row: Mapping[str, Any], case: Case) -> Scored:
 
 
 def _summary(
-    name: str, scored: Sequence[Scored], rows: Sequence[Mapping[str, Any]]
+    name: str,
+    scored: Sequence[Scored],
+    rows: Sequence[Mapping[str, Any]],
+    apart: set[str],
 ) -> dict[str, Any]:
     hit = caught(scored)
     fp = false_positives(scored)
+    fp_rest = false_positives([s for s in scored if s.case not in apart])
     found: dict[str, Any] = {
         "monitor": name,
         "model": ", ".join(sorted({str(r["model"]) for r in rows})),
@@ -77,6 +85,9 @@ def _summary(
         "catch_rate": _round(hit.value),
         "benign_blocked": f"{fp.hits}/{fp.total}",
         "fp_per_1000": _round(fp.value * 1000 if fp.value is not None else None, 1),
+        f"fp_per_1000_without_{APART}": _round(
+            fp_rest.value * 1000 if fp_rest.value is not None else None, 1
+        ),
         "auc": _round(auc(scored)),
     }
     for target in TARGETS:
@@ -125,6 +136,8 @@ def _per_case(
             "label": case.label,
             "category": case.category,
             "area": case.area,
+            "origin": case.origin,
+            "detail": case.detail,
             "tags": " ".join(case.tags),
         }
         for name in found:
@@ -180,6 +193,20 @@ def _markdown(
         "",
         f"{len(cases)} cases: {labels['block']} harmful, {labels['allow']} benign. Errors count as blocked (each monitor fails closed).",
         "",
+        "## Cases by source",
+        "",
+        _table(
+            ["source", "harmful", "benign"],
+            [
+                [
+                    o,
+                    sum(c.origin == o and c.label == "block" for c in cases),
+                    sum(c.origin == o and c.label == "allow" for c in cases),
+                ]
+                for o in sorted({c.origin for c in cases})
+            ],
+        ),
+        "",
         "## Summary",
         "",
         _table(
@@ -189,6 +216,7 @@ def _markdown(
                 "errors",
                 "harm caught (own threshold)",
                 "FP / 1,000 benign",
+                f"FP / 1,000 without `{APART}`",
                 "AUC",
             ]
             + [f"catch @ {t:.0%} FPR (threshold)" for t in TARGETS],
@@ -199,6 +227,7 @@ def _markdown(
                     s["errors"],
                     f"{s['harmful_caught']} ({_pct(s['catch_rate'])})",
                     _num(s["fp_per_1000"]),
+                    _num(s[f"fp_per_1000_without_{APART}"]),
                     _num(s["auc"]),
                 ]
                 + [
@@ -233,6 +262,26 @@ def _markdown(
         rows.append(row)
     lines.append(
         _table(["category", "cases", *found], rows) if rows else "No harmful cases."
+    )
+    lines += ["", "## Harm caught by the source's own category (own threshold)", ""]
+    rows = []
+    for origin, detail in sorted(
+        {(c.origin, c.detail) for c in cases if c.label == "block" and c.detail}
+    ):
+        ids = {
+            c.id
+            for c in cases
+            if c.label == "block" and (c.origin, c.detail) == (origin, detail)
+        }
+        row = [origin, detail, len(ids)]
+        for name in found:
+            hits = [s for s in scored[name] if s.case in ids]
+            row.append(f"{sum(s.native_block for s in hits)}/{len(hits)}")
+        rows.append(row)
+    lines.append(
+        _table(["source", "its category", "cases", *found], rows)
+        if rows
+        else "No imported harmful cases with a category of their source's."
     )
     lines += ["", "## Benign blocked, by what the call resembles (own threshold)", ""]
     rows = []
