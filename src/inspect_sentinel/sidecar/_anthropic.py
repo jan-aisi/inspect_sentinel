@@ -93,6 +93,7 @@ async def read_request(request: dict[str, Any]) -> list[ChatMessage]:
     messages = request.get("messages")
     if not isinstance(messages, list):
         raise UnreadableError("The request has no list of messages.")
+    _check_system(request.get("system"))
     texts: list[object] = []
     for entry in cast("list[object]", messages):
         if not isinstance(entry, dict):
@@ -100,6 +101,8 @@ async def read_request(request: dict[str, Any]) -> list[ChatMessage]:
         entry = cast("dict[str, Any]", entry)
         if entry.get("role") == "assistant" and isinstance(entry.get("content"), list):
             _check_blocks(entry["content"], "request")
+        if entry.get("role") == "system":
+            _check_system(entry.get("content"))
         _check_documents(entry.get("content"))
         texts.extend(_texts(entry))
     check_internal(texts, "request")
@@ -388,6 +391,28 @@ def _block_texts(blocks: object) -> list[object]:
                     _block_texts(cast("dict[str, Any]", source).get("content"))
                 )
     return texts
+
+
+def _check_system(system: object) -> None:
+    # The system prompt is a string or a list of text blocks. A system message
+    # among the messages can also hold blocks that add or remove tools.
+    # _system() reads only the `text` of each block, and inspect_ai's Anthropic
+    # converter only the text blocks of a system message. Both drop the rest
+    # without an error, while the model is sent all of it. See
+    # anthropic_system_to_texts() in inspect_ai's
+    # src/inspect_ai/agent/_bridge/anthropic_api_impl.py.
+    if system is None or isinstance(system, str):
+        return
+    if not isinstance(system, list):
+        raise UnreadableError(
+            "The request holds system content that is neither a string nor a list of blocks, which would not be read."
+        )
+    for block in cast("list[object]", system):
+        kind = _kind(block)
+        if kind != "text":
+            raise UnreadableError(
+                f"The request holds system content of a kind that would not be read: {kind!r}."
+            )
 
 
 def _check_documents(content: object) -> None:

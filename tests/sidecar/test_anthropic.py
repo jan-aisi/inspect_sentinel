@@ -292,7 +292,11 @@ async def test_reply_that_cannot_be_read(
         pytest.param(
             [
                 {"type": "text", "text": "Be brief."},
-                {"type": "text", "text": "Be kind."},
+                {
+                    "type": "text",
+                    "text": "Be kind.",
+                    "cache_control": {"type": "ephemeral"},
+                },
             ],
             "Be brief.\n\nBe kind.",
             id="system as blocks",
@@ -328,6 +332,57 @@ def _asked(*content: dict[str, Any]) -> bytes:
     return json.dumps(
         {"messages": [{"role": "user", "content": list(content)}]}
     ).encode()
+
+
+_IMAGE: dict[str, Any] = {
+    "type": "image",
+    "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+}
+
+
+def _system_of(system: object) -> bytes:
+    return json.dumps(
+        {"system": system, "messages": [{"role": "user", "content": "Hello"}]}
+    ).encode()
+
+
+def _system_message(content: object) -> bytes:
+    return json.dumps(
+        {
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": content},
+            ]
+        }
+    ).encode()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param("Be brief.", ["Be brief."], id="a string"),
+        pytest.param(
+            [
+                {"type": "text", "text": "Be brief."},
+                {
+                    "type": "text",
+                    "text": "Be kind.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            ["Be brief.", "Be kind."],
+            id="blocks",
+        ),
+    ],
+)
+async def test_a_system_message_of_text_is_read(
+    content: object, expected: list[str]
+) -> None:
+    messages = await read_request("anthropic", _system_message(content))
+
+    system = [m.text for m in messages if isinstance(m, ChatMessageSystem)]
+    assert system == expected
 
 
 @pytest.mark.anyio
@@ -403,6 +458,33 @@ async def test_document_of_one_block_is_read() -> None:
             _asked({"type": "image", "source": {"type": "file", "file_id": "file_1"}}),
             "message that can't be read",
             id="image from a file the provider keeps",
+        ),
+        pytest.param(
+            _system_of([{"type": "text", "text": "Be brief."}, _IMAGE]),
+            "system content of a kind that would not be read: 'image'",
+            id="system prompt with an image",
+        ),
+        pytest.param(
+            _system_of([{"type": "text", "text": "Be brief."}, "Be kind."]),
+            "system content of a kind that would not be read: None",
+            id="system prompt with an entry that is not a block",
+        ),
+        pytest.param(
+            _system_of({"type": "text", "text": "Be brief."}),
+            "neither a string nor a list of blocks",
+            id="system prompt that is not a string or a list",
+        ),
+        pytest.param(
+            _system_message(
+                [
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "get_weather"},
+                    }
+                ]
+            ),
+            "system content of a kind that would not be read: 'tool_addition'",
+            id="system message that adds a tool",
         ),
     ],
 )
